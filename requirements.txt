@@ -1,0 +1,28 @@
+langgraph
+langchain-core
+langchain-deepseek
+python-dotenv
+langsmith
+pydantic
+pydantic-settings
+matplotlib
+seaborn
+pandas
+IPython
+langchain_mcp_adapters
+uv
+dashscope
+
+# 新增依赖
+asyncpg>=0.29.0
+aiosqlite>=0.20.0
+psycopg2-binary>=2.9.9
+redis>=5.0.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+websockets>=12.0
+httpx>=0.25.0
+
+# LangMem 记忆管理依赖
+langmem>=0.1.0
+langgraph[store]>=0.5.0
