@@ -1,4 +1,19 @@
 """
+错误处理模块
+
+提供统一的错误处理、分类和监控功能。
+"""
+
+from enum import Enum
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, List
+from datetime import datetime
+import traceback
+import logging
+import asyncio
+from contextlib import asynccontextmanager
+
+"""
 多智能体LangGraph项目 - 错误处理和监控
 
 本模块提供错误处理和监控功能，包括：
@@ -689,3 +704,40 @@ def get_error_handler() -> ErrorHandler:
 def get_performance_monitor() -> PerformanceMonitor:
     """获取全局性能监控器"""
     return global_performance_monitor
+
+
+# 导出列表
+__all__ = [
+    # 枚举和数据类
+    "ErrorSeverity",
+    "ErrorCategory",
+    "ErrorContext",
+    "ErrorInfo",
+    
+    # 异常类
+    "BaseError",
+    "SystemError",
+    "ConfigurationError",
+    "DatabaseError",
+    "ConnectionError",
+    "APIError",
+    "AuthenticationError",
+    "AuthorizationError",
+    
+    # 错误处理
+    "ErrorHandler",
+    "get_error_handler",
+    "handle_errors",
+    "handle_async_errors",
+    
+    # 性能监控
+    "PerformanceMetric",
+    "PerformanceMonitor",
+    "get_performance_monitor",
+    "monitor_performance",
+    "monitor_async_performance",
+    
+    # 全局实例
+    "global_error_handler",
+    "global_performance_monitor"
+]

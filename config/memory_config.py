@@ -8,6 +8,10 @@ LangMem 记忆管理配置模块
 import os
 from typing import Optional, Literal
 from pydantic import Field
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
 
 # 兼容不同版本的 Pydantic
 try:
@@ -26,8 +30,8 @@ class MemoryConfig(BaseSettings):
     )
     postgres_url: str = Field(
         default_factory=lambda: os.getenv(
-            "LANGMEM_POSTGRES_URL", 
-            "postgresql://user:pass@localhost:5432/langmem"
+            "POSTGRES_URI", 
+            os.getenv("LANGMEM_POSTGRES_URL", "postgresql://user:pass@localhost:5432/langmem")
         ),
         description="PostgreSQL 连接URL"
     )
@@ -72,12 +76,18 @@ class MemoryConfig(BaseSettings):
     
     # 嵌入模型配置
     embedding_model: str = Field(
-        default="openai:text-embedding-3-small",
+        default_factory=lambda: os.getenv("LLM_EMBEDDING_MODEL", "openai:text-embedding-v4"),
         description="嵌入模型名称"
     )
     embedding_dims: int = Field(
-        default=1536,
+        default_factory=lambda: int(os.getenv("LLM_EMBEDDING_DIMENSIONS", "1024")),
         description="嵌入向量维度"
+    )
+    
+    # 记忆管理模型配置
+    memory_model: str = Field(
+        default_factory=lambda: os.getenv("LANGMEM_MODEL", "deepseek:deepseek-chat"),
+        description="记忆管理使用的语言模型"
     )
     
     # 记忆管理配置
@@ -96,7 +106,10 @@ class MemoryConfig(BaseSettings):
     
     # 缓存配置
     redis_url: Optional[str] = Field(
-        default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        default_factory=lambda: os.getenv(
+            "REDIS_URI", 
+            os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        ),
         description="Redis 连接URL"
     )
     cache_ttl: int = Field(

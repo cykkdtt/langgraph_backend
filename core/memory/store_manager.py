@@ -7,14 +7,32 @@ LangMem 存储管理器
 
 import asyncio
 import logging
+import os
 from typing import Optional, Dict, Any
-from langgraph.store.postgres import PostgresStore
+from langgraph.store.postgres.aio import AsyncPostgresStore
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.base import BaseStore
+from langchain_community.embeddings import DashScopeEmbeddings
 from langmem import create_memory_store_manager
 from config.memory_config import memory_config
 
 logger = logging.getLogger(__name__)
+
+
+def create_embeddings():
+    """创建嵌入模型实例"""
+    embedding_model = memory_config.embedding_model
+    
+    if embedding_model.startswith("openai:text-embedding-v"):
+        # 使用阿里云DashScope嵌入模型
+        model_name = embedding_model.split(":", 1)[1]  # 提取模型名称
+        return DashScopeEmbeddings(
+            model=model_name,
+            dashscope_api_key=os.getenv("DASHSCOPE_API_KEY")
+        )
+    else:
+        # 其他嵌入模型的处理逻辑可以在这里添加
+        raise ValueError(f"不支持的嵌入模型: {embedding_model}")
 
 
 class MemoryStoreManager:
@@ -32,36 +50,42 @@ class MemoryStoreManager:
             return
         
         try:
+            # 创建嵌入模型实例
+            embeddings = create_embeddings()
+            
             # 创建存储实例
             if memory_config.store_type == "postgres":
-                # PostgresStore.from_conn_string 返回上下文管理器，需要进入上下文
-                store_context = PostgresStore.from_conn_string(
+                # 使用from_conn_string创建AsyncPostgresStore上下文管理器
+                self._store_context = AsyncPostgresStore.from_conn_string(
                     memory_config.postgres_url,
                     index={
+                        "embed": embeddings,  # 使用DashScopeEmbeddings实例
                         "dims": memory_config.embedding_dims,
-                        "embed": memory_config.embedding_model
+                        "fields": ["$"]  # 对所有字段进行向量化
                     }
                 )
-                self.store = store_context.__enter__()
-                self._store_context = store_context  # 保存上下文管理器以便清理
+                self.store = await self._store_context.__aenter__()
                 logger.info("使用 PostgreSQL 存储")
             else:
                 self.store = InMemoryStore(
                     index={
+                        "embed": embeddings,  # 使用DashScopeEmbeddings实例
                         "dims": memory_config.embedding_dims,
-                        "embed": memory_config.embedding_model
+                        "fields": ["$"]  # 对所有字段进行向量化
                     }
                 )
                 self._store_context = None
                 logger.info("使用内存存储")
             
             # 设置存储
-            await self.store.setup()
+            if hasattr(self.store, 'setup'):
+                await self.store.setup()
             
             # 创建记忆存储管理器
             self.memory_manager = create_memory_store_manager(
+                memory_config.memory_model,
                 store=self.store,
-                namespace_prefix=memory_config.namespace_prefix
+                namespace=(memory_config.namespace_prefix, "{langgraph_user_id}")
             )
             
             self._initialized = True
@@ -76,7 +100,7 @@ class MemoryStoreManager:
         try:
             # 如果是PostgresStore，需要退出上下文管理器
             if self._store_context:
-                self._store_context.__exit__(None, None, None)
+                await self._store_context.__aexit__(None, None, None)
                 logger.info("PostgreSQL存储上下文已关闭")
             elif self.store and hasattr(self.store, 'close'):
                 await self.store.close()
@@ -182,3 +206,9 @@ async def get_memory_store_manager() -> MemoryStoreManager:
     if not memory_store_manager._initialized:
         await memory_store_manager.initialize()
     return memory_store_manager
+
+
+# 别名函数，保持向后兼容
+async def get_store_manager() -> MemoryStoreManager:
+    """获取记忆存储管理器实例（别名）"""
+    return await get_memory_store_manager()

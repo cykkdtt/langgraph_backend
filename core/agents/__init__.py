@@ -37,6 +37,19 @@ from .manager import (
     initialize_agent_manager
 )
 
+# 协作优化器
+from .collaboration_optimizer import (
+    CollaborationMode,
+    MessageType,
+    CollaborationMessage,
+    CollaborationTask,
+    CollaborationContext,
+    AgentCollaborationOrchestrator,
+    TaskScheduler,
+    LoadBalancer,
+    get_collaboration_orchestrator
+)
+
 # 暂时注释掉，因为这些类还没有实现
 # from .collaborative import SupervisorAgent, ResearchAgent, ChartAgent
 # from .rag import RAGAgent
@@ -70,6 +83,17 @@ __all__ = [
     "AgentManager",
     "get_agent_manager", 
     "initialize_agent_manager",
+    
+    # 协作优化器
+    "CollaborationMode",
+    "MessageType",
+    "CollaborationMessage",
+    "CollaborationTask",
+    "CollaborationContext",
+    "AgentCollaborationOrchestrator",
+    "TaskScheduler",
+    "LoadBalancer",
+    "get_collaboration_orchestrator",
     
     # 暂时注释掉
     # "SupervisorAgent",

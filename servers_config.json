@@ -6,8 +6,57 @@
           "-y",
           "@antv/mcp-server-chart"
         ],
-        "transport": "stdio"
+        "transport": "stdio",
+        "description": "图表生成服务器，支持各种数据可视化"
+      },
+      "mcp-server-filesystem": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-filesystem",
+          "/tmp"
+        ],
+        "transport": "stdio",
+        "description": "文件系统访问服务器，提供文件读写功能",
+        "enabled": false
+      },
+      "mcp-server-sqlite": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-sqlite",
+          "--db-path",
+          "./data/example.db"
+        ],
+        "transport": "stdio",
+        "description": "SQLite数据库服务器，提供数据库查询功能",
+        "enabled": false
+      },
+      "mcp-server-brave-search": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-brave-search"
+        ],
+        "transport": "stdio",
+        "description": "Brave搜索服务器，提供网络搜索功能",
+        "enabled": false,
+        "env": {
+          "BRAVE_API_KEY": "${BRAVE_API_KEY}"
+        }
+      },
+      "mcp-server-github": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-github"
+        ],
+        "transport": "stdio",
+        "description": "GitHub服务器，提供代码仓库访问功能",
+        "enabled": false,
+        "env": {
+          "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+        }
       }
-     
     }
   }

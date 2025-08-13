@@ -23,6 +23,28 @@ from pydantic import BaseModel, Field
 
 from config.settings import get_settings
 
+# MCP工具管理器导入
+try:
+    from .mcp_manager import MCPManager, get_mcp_manager, initialize_mcp_manager
+    MCP_AVAILABLE = True
+except ImportError:
+    MCP_AVAILABLE = False
+
+# 增强工具管理器导入
+try:
+    from .enhanced_tool_manager import (
+        ToolExecutionMode,
+        ToolValidationLevel,
+        ToolExecutionContext as EnhancedToolExecutionContext,
+        ToolExecutionResult as EnhancedToolExecutionResult,
+        ToolValidator,
+        EnhancedToolManager,
+        get_enhanced_tool_manager
+    )
+    ENHANCED_TOOL_MANAGER_AVAILABLE = True
+except ImportError:
+    ENHANCED_TOOL_MANAGER_AVAILABLE = False
+
 
 class ToolCategory(str, Enum):
     """工具分类"""
@@ -396,6 +418,89 @@ class ToolRegistry:
             "tools_by_category": by_category,
             "registered_tools": list(self._tools.keys())
         }
+    
+    async def load_mcp_tools(self) -> bool:
+        """加载MCP工具到注册表
+        
+        Returns:
+            bool: 是否成功加载
+        """
+        if not MCP_AVAILABLE:
+            self.logger.warning("MCP不可用，跳过MCP工具加载")
+            return False
+        
+        try:
+            # 初始化MCP管理器
+            await initialize_mcp_manager()
+            mcp_manager = get_mcp_manager()
+            
+            # 获取所有MCP工具
+            mcp_tools = await mcp_manager.get_all_tools()
+            
+            # 注册MCP工具到工具注册表
+            for tool in mcp_tools:
+                # 创建工具元数据
+                metadata = ToolMetadata(
+                    name=tool.name,
+                    description=tool.description,
+                    category=ToolCategory.MCP,
+                    permissions=[ToolPermission.EXECUTE],
+                    tags=["mcp", "external"],
+                    is_async=True,
+                    version="1.0.0"
+                )
+                
+                # 创建MCP工具包装器
+                class MCPToolWrapper(BaseManagedTool):
+                    def __init__(self, mcp_tool, metadata):
+                        super().__init__()
+                        self.mcp_tool = mcp_tool
+                        self.metadata = metadata
+                        self.name = metadata.name
+                        self.description = metadata.description
+                    
+                    async def _arun_with_context(self, context: ToolExecutionContext, *args, **kwargs):
+                        return await self.mcp_tool.ainvoke(kwargs)
+                    
+                    def _run_with_context(self, context: ToolExecutionContext, *args, **kwargs):
+                        # MCP工具通常是异步的，这里提供同步包装
+                        import asyncio
+                        return asyncio.run(self.mcp_tool.ainvoke(kwargs))
+                
+                # 注册包装后的工具
+                wrapped_tool = MCPToolWrapper(tool, metadata)
+                self.register_tool(wrapped_tool)
+            
+            self.logger.info(f"成功加载 {len(mcp_tools)} 个MCP工具")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"加载MCP工具失败: {e}")
+            return False
+    
+    async def refresh_mcp_tools(self) -> bool:
+        """刷新MCP工具
+        
+        Returns:
+            bool: 是否成功刷新
+        """
+        if not MCP_AVAILABLE:
+            return False
+        
+        try:
+            # 移除现有的MCP工具
+            mcp_tools = [name for name, metadata in self._tool_metadata.items() 
+                        if metadata.category == ToolCategory.MCP]
+            
+            for tool_name in mcp_tools:
+                self.unregister_tool(tool_name)
+            
+            # 重新加载MCP工具
+            return await self.load_mcp_tools()
+            
+        except Exception as e:
+            self.logger.error(f"刷新MCP工具失败: {e}")
+            return False
 
 
 # 全局工具注册表实例
@@ -463,3 +568,49 @@ def managed_tool(
         return func
     
     return decorator
+
+
+# 导出列表
+__all__ = [
+    # 基础类和枚举
+    "ToolCategory",
+    "ToolPermission",
+    "ToolMetadata",
+    "ToolExecutionResult",
+    "ToolExecutionContext",
+    "BaseManagedTool",
+    
+    # 工具注册表
+    "ToolRegistry",
+    "get_tool_registry",
+    
+    # 装饰器
+    "managed_tool",
+    
+    # MCP相关（如果可用）
+    "MCPManager",
+    "get_mcp_manager", 
+    "initialize_mcp_manager",
+    
+    # 增强工具管理器（如果可用）
+    "ToolExecutionMode",
+    "ToolValidationLevel", 
+    "EnhancedToolExecutionContext",
+    "EnhancedToolExecutionResult",
+    "ToolValidator",
+    "EnhancedToolManager",
+    "get_enhanced_tool_manager",
+]
+
+# 根据可用性动态调整导出列表
+if not MCP_AVAILABLE:
+    __all__ = [item for item in __all__ if item not in [
+        "MCPManager", "get_mcp_manager", "initialize_mcp_manager"
+    ]]
+
+if not ENHANCED_TOOL_MANAGER_AVAILABLE:
+    __all__ = [item for item in __all__ if item not in [
+        "ToolExecutionMode", "ToolValidationLevel", "EnhancedToolExecutionContext",
+        "EnhancedToolExecutionResult", "ToolValidator", "EnhancedToolManager", 
+        "get_enhanced_tool_manager"
+    ]]

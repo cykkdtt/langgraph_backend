@@ -12,6 +12,7 @@ IPython
 langchain_mcp_adapters
 uv
 dashscope
+greenlet
 
 # 新增依赖
 asyncpg>=0.29.0

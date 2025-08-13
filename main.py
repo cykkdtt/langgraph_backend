@@ -30,8 +30,14 @@ from core.agents import (
 )
 from core.tools import get_tool_registry
 from core.memory import get_memory_manager
+from core.memory.store_manager import get_store_manager
 from core.cache.redis_manager import get_cache_manager
 from core.error import get_error_handler, get_performance_monitor
+
+# API路由导入
+from core.tools.mcp_api import router as mcp_router
+from core.time_travel.time_travel_api import router as time_travel_router
+from core.optimization.prompt_optimization_api import router as prompt_optimization_router
 
 
 # 数据模型
@@ -82,6 +88,34 @@ async def lifespan(app: FastAPI):
         app.state.error_handler = get_error_handler()
         app.state.performance_monitor = get_performance_monitor()
         
+        # 初始化提示词优化器
+        try:
+            from core.optimization.prompt_optimizer import PromptOptimizer, FeedbackCollector, AutoOptimizationScheduler
+            
+            # 创建提示词优化器实例
+            prompt_optimizer = PromptOptimizer(app.state.memory_manager)
+            feedback_collector = FeedbackCollector(app.state.memory_manager)
+            auto_scheduler = AutoOptimizationScheduler(prompt_optimizer, feedback_collector)
+            
+            # 初始化优化器
+            await prompt_optimizer.initialize()
+            
+            # 存储到应用状态
+            app.state.prompt_optimizer = prompt_optimizer
+            app.state.feedback_collector = feedback_collector
+            app.state.auto_scheduler = auto_scheduler
+            
+            logger.info("提示词优化器初始化完成")
+        except Exception as e:
+            logger.warning(f"提示词优化器初始化失败: {e}")
+        
+        # 加载MCP工具到工具注册表
+        try:
+            await app.state.tool_registry.load_mcp_tools()
+            logger.info("MCP工具加载完成")
+        except Exception as e:
+            logger.warning(f"MCP工具加载失败: {e}")
+        
         logger = logging.getLogger("app")
         logger.info("应用启动完成")
         
@@ -89,6 +123,15 @@ async def lifespan(app: FastAPI):
         
         # 关闭时清理资源
         logger.info("应用正在关闭...")
+        
+        # 停止自动优化调度器
+        if hasattr(app.state, 'auto_scheduler'):
+            try:
+                await app.state.auto_scheduler.stop_auto_optimization()
+                logger.info("自动优化调度器已停止")
+            except Exception as e:
+                logger.warning(f"停止自动优化调度器失败: {e}")
+        
         await app.state.agent_manager.stop()
         await app.state.cache_manager.cleanup()
 
@@ -113,6 +156,11 @@ def create_app() -> FastAPI:
         allow_methods=settings.app.cors_methods,
         allow_headers=settings.app.cors_headers,
     )
+    
+    # 注册API路由
+    app.include_router(mcp_router, prefix="/api/v1")
+    app.include_router(time_travel_router, prefix="/api/v1")
+    app.include_router(prompt_optimization_router, prefix="/api/v1")
     
     return app
 

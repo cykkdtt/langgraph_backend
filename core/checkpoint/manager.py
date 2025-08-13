@@ -15,7 +15,6 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic import BaseModel, Field
@@ -50,7 +49,7 @@ class CheckpointManager:
         """初始化检查点管理器
         
         Args:
-            storage_type: 存储类型 ("postgres", "sqlite", "memory")
+            storage_type: 存储类型 ("postgres", "memory")
         """
         self.storage_type = storage_type
         self.settings = get_settings()
@@ -75,13 +74,6 @@ class CheckpointManager:
             if self.storage_type == "postgres":
                 self._context_manager = AsyncPostgresSaver.from_conn_string(
                     self.settings.database.postgres_url
-                )
-                self._checkpointer = await self._context_manager.__aenter__()
-                
-            elif self.storage_type == "sqlite":
-                db_path = "checkpoints.db"
-                self._context_manager = AsyncSqliteSaver.from_conn_string(
-                    f"sqlite:///{db_path}"
                 )
                 self._checkpointer = await self._context_manager.__aenter__()
                 
@@ -140,22 +132,47 @@ class CheckpointManager:
         """
         checkpointer = await self.get_checkpointer()
         
-        # 准备检查点数据
-        checkpoint_data = {
-            "state": state,
-            "metadata": {
-                "timestamp": datetime.utcnow().isoformat(),
-                **(metadata or {})
-            }
+        # 准备检查点数据 - 按照LangGraph标准格式
+        import uuid
+        from datetime import datetime
+        
+        checkpoint_id = str(uuid.uuid4())
+        
+        # 确保config包含必需的参数
+        if "configurable" not in config:
+            config["configurable"] = {}
+        
+        # 添加必需的checkpoint_ns参数
+        if "checkpoint_ns" not in config["configurable"]:
+            config["configurable"]["checkpoint_ns"] = ""
+        
+        checkpoint = {
+            "v": 1,  # 版本号
+            "ts": datetime.utcnow().isoformat(),  # 时间戳
+            "id": checkpoint_id,  # 检查点ID
+            "channel_values": state,  # 状态数据
+            "channel_versions": {},  # 通道版本
+            "versions_seen": {}  # 已见版本
         }
         
-        # 保存检查点
-        checkpoint = await checkpointer.aput(config, checkpoint_data)
+        # 准备元数据
+        checkpoint_metadata = {
+            "timestamp": datetime.utcnow().isoformat(),
+            **(metadata or {})
+        }
+        
+        # 保存检查点 - 使用正确的参数格式
+        saved_config = await checkpointer.aput(
+            config, 
+            checkpoint, 
+            checkpoint_metadata, 
+            {}  # writes (待写入数据)
+        )
         
         thread_id = config.get("configurable", {}).get("thread_id", "unknown")
-        self.logger.info(f"保存检查点成功: thread_id={thread_id}")
+        self.logger.info(f"保存检查点成功: thread_id={thread_id}, checkpoint_id={checkpoint_id}")
         
-        return checkpoint.get("id", "unknown")
+        return checkpoint_id
     
     async def load_checkpoint(
         self, 
@@ -171,26 +188,30 @@ class CheckpointManager:
         """
         checkpointer = await self.get_checkpointer()
         
-        checkpoint = await checkpointer.aget(config)
-        if not checkpoint:
+        # 使用正确的方法获取检查点元组
+        checkpoint_tuple = await checkpointer.aget_tuple(config)
+        if not checkpoint_tuple:
             return None
         
+        checkpoint = checkpoint_tuple.checkpoint
+        checkpoint_config = checkpoint_tuple.config
+        checkpoint_metadata = checkpoint_tuple.metadata or {}
+        
         # 解析元数据
-        metadata_dict = checkpoint.get("metadata", {})
         metadata = CheckpointMetadata(
             checkpoint_id=checkpoint.get("id", "unknown"),
             thread_id=config.get("configurable", {}).get("thread_id", "unknown"),
             timestamp=datetime.fromisoformat(
-                metadata_dict.get("timestamp", datetime.utcnow().isoformat())
+                checkpoint.get("ts", datetime.utcnow().isoformat())
             ),
-            agent_type=metadata_dict.get("agent_type"),
-            user_id=metadata_dict.get("user_id"),
-            metadata=metadata_dict
+            agent_type=checkpoint_metadata.get("agent_type"),
+            user_id=checkpoint_metadata.get("user_id"),
+            metadata=checkpoint_metadata
         )
         
         return CheckpointInfo(
-            config=config,
-            state=checkpoint.get("state", {}),
+            config=checkpoint_config,
+            state=checkpoint.get("channel_values", {}),
             metadata=metadata
         )
     
@@ -213,27 +234,34 @@ class CheckpointManager:
         checkpointer = await self.get_checkpointer()
         
         checkpoints = []
-        async for checkpoint in checkpointer.alist(
-            config, 
-            limit=limit, 
-            before=before
+        # 使用正确的alist方法，传递before参数
+        list_config = {**config}
+        if before:
+            list_config["before"] = before
+            
+        async for checkpoint_tuple in checkpointer.alist(
+            list_config, 
+            limit=limit
         ):
+            checkpoint = checkpoint_tuple.checkpoint
+            checkpoint_config = checkpoint_tuple.config
+            checkpoint_metadata = checkpoint_tuple.metadata or {}
+            
             # 解析元数据
-            metadata_dict = checkpoint.get("metadata", {})
             metadata = CheckpointMetadata(
                 checkpoint_id=checkpoint.get("id", "unknown"),
                 thread_id=config.get("configurable", {}).get("thread_id", "unknown"),
                 timestamp=datetime.fromisoformat(
-                    metadata_dict.get("timestamp", datetime.utcnow().isoformat())
+                    checkpoint.get("ts", datetime.utcnow().isoformat())
                 ),
-                agent_type=metadata_dict.get("agent_type"),
-                user_id=metadata_dict.get("user_id"),
-                metadata=metadata_dict
+                agent_type=checkpoint_metadata.get("agent_type"),
+                user_id=checkpoint_metadata.get("user_id"),
+                metadata=checkpoint_metadata
             )
             
             checkpoints.append(CheckpointInfo(
-                config=config,
-                state=checkpoint.get("state", {}),
+                config=checkpoint_config,
+                state=checkpoint.get("channel_values", {}),
                 metadata=metadata
             ))
         

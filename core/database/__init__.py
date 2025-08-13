@@ -340,3 +340,16 @@ async def get_async_session():
     """获取SQLAlchemy会话的便捷函数"""
     async with database_manager.get_async_session() as session:
         yield session
+
+
+# 导出列表
+__all__ = [
+    "Base",
+    "DatabaseManager",
+    "database_manager",
+    "get_database_manager",
+    "initialize_database",
+    "get_postgres_connection",
+    "get_redis_connection",
+    "get_async_session"
+]
