@@ -10,7 +10,7 @@
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, AsyncGenerator, Union
+from typing import List, Dict, Any, Optional, AsyncGenerator, AsyncIterator, Union
 from datetime import datetime
 import uuid
 
@@ -19,7 +19,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from .base import BaseAgent, AgentType, AgentStatus, ChatRequest, ChatResponse, StreamChunk
+from .base import BaseAgent, AgentType, AgentStatus, StreamChunk, ChatRequest, ChatResponse
 from ..memory import (
     LangMemManager, 
     MemoryNamespace, 
@@ -30,6 +30,7 @@ from ..memory import (
     get_memory_manager
 )
 from ..memory.tools import MemoryToolsFactory, get_memory_tools
+from models.api_models import WebSocketMessage, WebSocketMessageType
 
 logger = logging.getLogger(__name__)
 
@@ -46,80 +47,130 @@ class MemoryEnhancedAgent(BaseAgent):
     
     def __init__(
         self,
-        agent_id: str,
-        name: str,
-        description: str,
-        llm,
-        tools: Optional[List] = None,
-        checkpointer: Optional[BaseCheckpointSaver] = None,
-        memory_config: Optional[Dict[str, Any]] = None,
+        config=None,
+        memory_manager=None,
         **kwargs
     ):
         """初始化记忆增强智能体
         
         Args:
-            agent_id: 智能体ID
-            name: 智能体名称
-            description: 智能体描述
-            llm: 语言模型
-            tools: 工具列表
-            checkpointer: 检查点保存器
-            memory_config: 记忆配置
+            config: 智能体配置对象
+            memory_manager: 后台记忆管理器
             **kwargs: 其他参数
         """
-        super().__init__(
-            agent_id=agent_id,
-            name=name,
-            description=description,
-            llm=llm,
-            tools=tools or [],
-            checkpointer=checkpointer,
-            **kwargs
-        )
+        # 使用配置对象初始化基类
+        super().__init__(config=config, **kwargs)
+        
+        # 后台记忆管理器
+        self.background_memory_manager = memory_manager
         
         # 记忆配置
-        self.memory_config = memory_config or {}
-        self.auto_store_memories = self.memory_config.get("auto_store", True)
-        self.memory_retrieval_limit = self.memory_config.get("retrieval_limit", 5)
-        self.memory_importance_threshold = self.memory_config.get("importance_threshold", 0.3)
+        memory_config = getattr(config, 'memory_config', {}) if config else {}
+        self.auto_store_memories = memory_config.get("auto_store", True)
+        self.memory_retrieval_limit = memory_config.get("retrieval_limit", 5)
+        self.memory_importance_threshold = memory_config.get("importance_threshold", 0.4)
         
-        # 记忆管理器
+        # 记忆命名空间（从配置获取）
+        self.memory_namespace = getattr(config, 'memory_namespace', None) if config else None
+        
+        # 记忆管理器（保持兼容性）
         self.memory_manager: Optional[LangMemManager] = None
         self.memory_tools_factory = MemoryToolsFactory()
         
-        # 记忆命名空间
+        # 记忆命名空间缓存
         self.user_namespace_cache: Dict[str, MemoryNamespace] = {}
         self.agent_namespace_cache: Dict[str, MemoryNamespace] = {}
         
-        logger.info(f"记忆增强智能体初始化: {self.agent_id}")
+        logger.info(f"记忆增强智能体初始化: {self.agent_id}, 命名空间: {self.memory_namespace}")
+    
+    async def _build_graph(self) -> None:
+        """构建支持工具调用的LangGraph图"""
+        from langgraph.prebuilt import create_react_agent
+        
+        # 使用LangGraph的预构建ReAct智能体，支持工具调用
+        if self.tools:
+            # 创建支持工具的ReAct智能体
+            self.compiled_graph = create_react_agent(
+                model=self.llm,
+                tools=self.tools,
+                checkpointer=self.checkpointer
+            )
+            # 设置self.graph为None，表示使用预编译的图
+            self.graph = None
+            logger.info(f"创建支持工具调用的ReAct智能体，工具数量: {len(self.tools)}")
+        else:
+            # 如果没有工具，使用基础图
+            await super()._build_graph()
+            logger.info("创建基础对话智能体（无工具）")
     
     async def initialize(self) -> None:
         """初始化智能体和记忆系统"""
-        await super().initialize()
-        
         # 初始化记忆管理器
         self.memory_manager = get_memory_manager()
         await self.memory_manager.initialize()
+        
+        # 添加协作工具到智能体工具集
+        await self._add_collaboration_tools()
         
         # 添加记忆工具到智能体工具集
         if self.auto_store_memories:
             await self._add_memory_tools()
         
+        # 构建图
+        await self._build_graph()
+        
+        # 如果使用create_react_agent，它已经返回编译好的图
+        if hasattr(self, 'compiled_graph') and self.compiled_graph is not None:
+            # create_react_agent已经返回编译好的图，无需再次编译
+            self.initialized = True
+            logger.info(f"使用预编译的ReAct智能体: {self.agent_id}")
+        else:
+            # 使用父类的初始化逻辑来编译图
+            if self.graph is not None:
+                self.compiled_graph = self.graph.compile(
+                    checkpointer=self.checkpointer,
+                    interrupt_before=self.interrupt_before,
+                    interrupt_after=self.interrupt_after
+                )
+                self.initialized = True
+                logger.info(f"编译基础图完成: {self.agent_id}")
+            else:
+                raise ValueError("图构建失败：self.graph 和 self.compiled_graph 都为 None")
+        
         logger.info(f"记忆增强智能体初始化完成: {self.agent_id}")
     
     async def _add_memory_tools(self) -> None:
-        """添加记忆管理工具到智能体"""
+        """添加LangMem官方记忆管理工具到智能体"""
         try:
-            # 创建通用记忆工具
-            memory_tools = await get_memory_tools(f"agent_{self.agent_id}")
+            # 使用配置的命名空间或默认命名空间
+            namespace = self.memory_namespace or f"agent_{self.agent_id}"
+            
+            # 创建包装好的记忆工具
+            memory_tools = await self.memory_tools_factory.create_memory_tools(namespace)
             
             # 添加到智能体工具集
             self.tools.extend(memory_tools)
             
-            logger.info(f"记忆工具添加成功: {len(memory_tools)} 个工具")
+            logger.info(f"LangMem官方记忆工具添加成功: 2 个工具 (管理+搜索), 命名空间: {namespace}")
             
         except Exception as e:
-            logger.error(f"添加记忆工具失败: {e}")
+            logger.error(f"添加LangMem记忆工具失败: {e}")
+    
+    async def _add_collaboration_tools(self) -> None:
+        """添加协作工具到智能体"""
+        try:
+            from ..tools.collaboration_tools import get_all_collaboration_tools
+            
+            # 获取所有协作工具
+            collaboration_tools = get_all_collaboration_tools()
+            
+            # 添加到智能体工具集
+            self.tools.extend(collaboration_tools)
+            
+            logger.info(f"协作工具添加成功: {len(collaboration_tools)} 个工具")
+            
+        except Exception as e:
+            logger.error(f"添加协作工具失败: {e}")
     
     def _get_user_namespace(self, user_id: str) -> MemoryNamespace:
         """获取用户记忆命名空间"""
@@ -148,77 +199,20 @@ class MemoryEnhancedAgent(BaseAgent):
         session_id: str,
         metadata: Optional[Dict[str, Any]] = None
     ) -> None:
-        """存储对话记忆"""
-        if not self.auto_store_memories or not self.memory_manager:
-            return
-        
+        """存储对话记忆 - 使用LangMem官方智能体主动管理"""
         try:
-            # 用户命名空间 - 存储用户相关记忆
-            user_namespace = self._get_user_namespace(user_id)
+            # 注意：现在记忆存储由智能体通过工具主动决定
+            # 不再使用算法自动评估和存储
+            # 智能体会根据对话内容主动调用记忆管理工具来保存重要信息
             
-            # 智能体命名空间 - 存储会话相关记忆
-            agent_namespace = self._get_agent_namespace(session_id)
-            
-            # 构建对话记忆内容
-            conversation_content = f"用户: {user_message}\n智能体: {ai_response}"
-            
-            # 计算重要性评分（简单实现，可以使用更复杂的算法）
-            importance_score = self._calculate_importance(user_message, ai_response)
-            
-            # 准备元数据
-            memory_metadata = {
-                "user_id": user_id,
-                "session_id": session_id,
-                "agent_id": self.agent_id,
-                "conversation_turn": True,
-                **(metadata or {})
-            }
-            
-            # 存储情节记忆（对话历史）
-            if importance_score >= self.memory_importance_threshold:
-                episodic_memory = MemoryItem(
-                    id=f"conv_{session_id}_{datetime.utcnow().timestamp()}",
-                    content=conversation_content,
-                    memory_type=MemoryType.EPISODIC,
-                    metadata=memory_metadata,
-                    importance=importance_score
-                )
-                
-                await self.memory_manager.store_memory(agent_namespace, episodic_memory)
-                logger.debug(f"存储对话记忆: session={session_id}, importance={importance_score}")
+            logger.info(
+                "记忆存储现在由智能体主动管理，通过LangMem工具决定保存什么内容"
+            )
             
         except Exception as e:
-            logger.error(f"存储对话记忆失败: {e}")
+            logger.error(f"记忆存储配置失败: {e}")
     
-    def _calculate_importance(self, user_message: str, ai_response: str) -> float:
-        """计算记忆重要性评分
-        
-        简单的启发式算法，实际应用中可以使用更复杂的模型
-        """
-        importance = 0.5  # 基础分数
-        
-        # 消息长度因子
-        total_length = len(user_message) + len(ai_response)
-        if total_length > 200:
-            importance += 0.1
-        if total_length > 500:
-            importance += 0.1
-        
-        # 关键词检测
-        important_keywords = [
-            "重要", "关键", "记住", "学习", "总结", "计划", "目标", 
-            "问题", "解决", "方案", "建议", "决定", "选择"
-        ]
-        
-        text = user_message + " " + ai_response
-        keyword_count = sum(1 for keyword in important_keywords if keyword in text)
-        importance += min(keyword_count * 0.05, 0.2)
-        
-        # 问号数量（表示用户的疑问）
-        question_count = user_message.count("?") + user_message.count("？")
-        importance += min(question_count * 0.05, 0.1)
-        
-        return min(importance, 1.0)
+    # 移除了 _calculate_importance 方法，因为现在使用LangMem官方智能体主动管理记忆
     
     async def _retrieve_relevant_memories(
         self,
@@ -227,61 +221,19 @@ class MemoryEnhancedAgent(BaseAgent):
         session_id: str,
         memory_types: Optional[List[MemoryType]] = None
     ) -> List[MemoryItem]:
-        """检索相关记忆"""
-        if not self.memory_manager:
-            return []
-        
+        """检索相关记忆 - 现在由智能体通过LangMem工具主动搜索"""
         try:
-            relevant_memories = []
+            # 注意：现在记忆检索由智能体通过搜索工具主动进行
+            # 不再在后台自动检索记忆
+            # 智能体会根据需要主动调用记忆搜索工具
             
-            # 默认检索所有类型的记忆
-            if not memory_types:
-                memory_types = [MemoryType.SEMANTIC, MemoryType.EPISODIC, MemoryType.PROCEDURAL]
-            
-            # 从用户命名空间检索
-            user_namespace = self._get_user_namespace(user_id)
-            for memory_type in memory_types:
-                memory_query = MemoryQuery(
-                    query=query,
-                    memory_type=memory_type,
-                    limit=self.memory_retrieval_limit // len(memory_types),
-                    min_importance=self.memory_importance_threshold
-                )
-                
-                memories = await self.memory_manager.search_memories(user_namespace, memory_query)
-                relevant_memories.extend(memories)
-            
-            # 从智能体命名空间检索
-            agent_namespace = self._get_agent_namespace(session_id)
-            for memory_type in memory_types:
-                memory_query = MemoryQuery(
-                    query=query,
-                    memory_type=memory_type,
-                    limit=self.memory_retrieval_limit // len(memory_types),
-                    min_importance=self.memory_importance_threshold
-                )
-                
-                memories = await self.memory_manager.search_memories(agent_namespace, memory_query)
-                relevant_memories.extend(memories)
-            
-            # 按重要性排序并去重
-            relevant_memories.sort(key=lambda x: x.importance, reverse=True)
-            unique_memories = []
-            seen_content = set()
-            
-            for memory in relevant_memories:
-                if memory.content not in seen_content:
-                    unique_memories.append(memory)
-                    seen_content.add(memory.content)
-                    
-                if len(unique_memories) >= self.memory_retrieval_limit:
-                    break
-            
-            logger.debug(f"检索到相关记忆: {len(unique_memories)} 条")
-            return unique_memories
+            logger.info(
+                "记忆检索现在由智能体主动管理，通过LangMem搜索工具获取相关记忆"
+            )
+            return []
             
         except Exception as e:
-            logger.error(f"检索相关记忆失败: {e}")
+            logger.error(f"记忆检索配置失败: {e}")
             return []
     
     def _format_memories_for_context(self, memories: List[MemoryItem]) -> str:
@@ -358,113 +310,101 @@ class MemoryEnhancedAgent(BaseAgent):
     
     async def chat(
         self,
-        request: ChatRequest,
+        request,  # 使用通用类型，支持不同的ChatRequest格式
         config: Optional[RunnableConfig] = None
     ) -> ChatResponse:
-        """记忆增强的对话处理"""
+        """LangMem智能体主动管理记忆的对话处理"""
         try:
             # 确保初始化
             if not self.initialized:
                 await self.initialize()
             
-            # 使用记忆增强消息
-            enhanced_messages = await self._enhance_messages_with_memory(
-                request.messages,
-                request.user_id,
-                request.session_id
-            )
+            # 适配不同的ChatRequest格式
+            if hasattr(request, 'messages'):
+                # core.agents.base.ChatRequest格式
+                messages = request.messages
+            elif hasattr(request, 'message'):
+                # models.chat_models.ChatRequest格式
+                messages = [HumanMessage(content=request.message)]
+            else:
+                raise ValueError("不支持的ChatRequest格式")
             
-            # 创建增强的请求
-            enhanced_request = ChatRequest(
-                messages=enhanced_messages,
-                user_id=request.user_id,
+            # 准备状态
+            state = {
+                "messages": messages
+            }
+            
+            # 执行支持工具调用的图
+            result = await self.compiled_graph.ainvoke(state, config=config)
+            
+            # 获取最后一条AI消息
+            ai_messages = [msg for msg in result["messages"] if isinstance(msg, AIMessage)]
+            last_message = ai_messages[-1] if ai_messages else AIMessage(content="无响应")
+            
+            logger.info("对话处理完成，智能体可通过LangMem工具主动管理记忆")
+            
+            return ChatResponse(
+                message=last_message,
                 session_id=request.session_id,
-                stream=request.stream,
-                metadata=request.metadata
+                agent_id=self.agent_id,
+                metadata=result.get("metadata", {}),
             )
-            
-            # 调用父类的对话处理
-            response = await super().chat(enhanced_request, config)
-            
-            # 存储对话记忆
-            if response.message and enhanced_messages:
-                last_user_message = None
-                for msg in reversed(request.messages):  # 使用原始消息
-                    if isinstance(msg, HumanMessage):
-                        last_user_message = msg.content
-                        break
-                
-                if last_user_message:
-                    await self._store_conversation_memory(
-                        user_message=last_user_message,
-                        ai_response=response.message.content,
-                        user_id=request.user_id,
-                        session_id=request.session_id,
-                        metadata=request.metadata
-                    )
-            
-            return response
             
         except Exception as e:
-            logger.error(f"记忆增强对话处理失败: {e}")
+            logger.error(f"对话处理失败: {e}")
             # 降级到基础对话处理
             return await super().chat(request, config)
     
     async def stream_chat(
         self,
-        request: ChatRequest,
+        request,  # 使用通用类型，支持不同的ChatRequest格式
         config: Optional[RunnableConfig] = None
-    ) -> AsyncGenerator[StreamChunk, None]:
-        """记忆增强的流式对话处理"""
+    ) -> AsyncIterator[StreamChunk]:
+        """LangMem智能体主动管理记忆的流式对话处理"""
         try:
             # 确保初始化
             if not self.initialized:
                 await self.initialize()
             
-            # 使用记忆增强消息
-            enhanced_messages = await self._enhance_messages_with_memory(
-                request.messages,
-                request.user_id,
-                request.session_id
+            # 适配不同的ChatRequest格式
+            if hasattr(request, 'messages'):
+                # core.agents.base.ChatRequest格式
+                messages = request.messages
+            elif hasattr(request, 'message'):
+                # models.chat_models.ChatRequest格式
+                messages = [HumanMessage(content=request.message)]
+            else:
+                raise ValueError("不支持的ChatRequest格式")
+            
+            # 准备状态
+            state = {
+                "messages": messages
+            }
+            
+            # 流式执行支持工具调用的图
+            async for chunk in self.compiled_graph.astream(state, config=config):
+                # 处理不同类型的流式输出
+                for node_name, node_output in chunk.items():
+                    if "messages" in node_output:
+                        for message in node_output["messages"]:
+                            if isinstance(message, AIMessage):
+                                yield StreamChunk(
+                                    chunk_type="message",
+                                    content=message.content,
+                                    metadata={"node": node_name}
+                                )
+            
+            # 发送完成信号
+            yield StreamChunk(
+                chunk_type="done",
+                content="",
+                metadata={"status": "completed"}
             )
             
-            # 创建增强的请求
-            enhanced_request = ChatRequest(
-                messages=enhanced_messages,
-                user_id=request.user_id,
-                session_id=request.session_id,
-                stream=True,
-                metadata=request.metadata
-            )
-            
-            # 收集完整响应用于记忆存储
-            full_response = ""
-            
-            # 流式处理
-            async for chunk in super().stream_chat(enhanced_request, config):
-                if chunk.content:
-                    full_response += chunk.content
-                yield chunk
-            
-            # 存储对话记忆
-            if full_response:
-                last_user_message = None
-                for msg in reversed(request.messages):  # 使用原始消息
-                    if isinstance(msg, HumanMessage):
-                        last_user_message = msg.content
-                        break
-                
-                if last_user_message:
-                    await self._store_conversation_memory(
-                        user_message=last_user_message,
-                        ai_response=full_response,
-                        user_id=request.user_id,
-                        session_id=request.session_id,
-                        metadata=request.metadata
-                    )
+            logger.info("流式对话处理完成，智能体可通过LangMem工具主动管理记忆")
             
         except Exception as e:
-            logger.error(f"记忆增强流式对话处理失败: {e}")
+            logger.error(f"流式对话处理失败: {e}")
             # 降级到基础流式处理
             async for chunk in super().stream_chat(request, config):
                 yield chunk
@@ -561,3 +501,53 @@ class MemoryEnhancedAgent(BaseAgent):
         except Exception as e:
             logger.error(f"清理旧记忆失败: {e}")
             return {"user_deleted": 0, "session_deleted": 0}
+    
+    async def _send_memory_saved_event(
+        self,
+        user_id: str,
+        session_id: str,
+        memory_item: MemoryItem,
+        important_info: List[str]
+    ) -> None:
+        """发送记忆保存事件到前端"""
+        try:
+            # 使用绝对导入获取WebSocket连接管理器
+            from api.websocket import connection_manager
+            from models.chat_models import WebSocketMessage, WebSocketMessageType
+            import uuid
+            
+            # 构建记忆保存事件数据
+            # 优先显示重要信息摘要，而不是完整对话内容
+            if important_info and len(important_info) > 0:
+                # 如果有重要信息，显示重要信息列表
+                content_summary = "保存了以下重要信息: " + ", ".join(important_info)
+            else:
+                # 如果没有重要信息，显示通用提示
+                content_summary = f"保存了{memory_item.memory_type.value}记忆 (重要性: {memory_item.importance:.1f})"
+            
+            memory_data = {
+                "memory_id": memory_item.id,
+                "content": content_summary,
+                "memory_type": memory_item.memory_type.value,
+                "importance": memory_item.importance,
+                "important_info": important_info,
+                "timestamp": memory_item.created_at.isoformat() if hasattr(memory_item, 'created_at') else datetime.utcnow().isoformat(),
+                "agent_id": self.agent_id,
+                "agent_name": self.name
+            }
+            
+            # 创建WebSocket消息
+            ws_message = WebSocketMessage(
+                type=WebSocketMessageType.MEMORY_SAVED,
+                data=memory_data,
+                user_id=user_id,
+                session_id=session_id
+            )
+            
+            # 发送到用户的所有连接
+            await connection_manager.send_to_user(user_id, ws_message)
+            
+            logger.info(f"✅ 记忆保存事件已发送到前端 - user_id: {user_id}, memory_id: {memory_item.id}")
+            
+        except Exception as e:
+            logger.error(f"❌ 发送记忆保存事件失败: {e}", exc_info=True)

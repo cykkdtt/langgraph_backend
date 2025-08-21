@@ -14,9 +14,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from langchain_core.tools import BaseTool, StructuredTool
-from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain_core.callbacks import CallbackManagerForToolRun
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from .mcp_manager import get_mcp_manager
 

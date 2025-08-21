@@ -68,9 +68,9 @@ class DatabaseInitializer:
         logger.info("检查数据库连接...")
         
         try:
-            async with self.engine.begin() as conn:
-                result = await conn.execute(text("SELECT 1"))
-                await result.fetchone()
+            # 直接使用asyncpg连接池进行测试
+            async with self.db_manager.postgres_pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
             logger.info("数据库连接正常")
             return True
         except Exception as e:
@@ -82,10 +82,13 @@ class DatabaseInitializer:
         """获取现有表列表"""
         logger.info("获取现有表列表...")
         
-        async with self.engine.begin() as conn:
-            # 使用SQLAlchemy的inspect功能
-            inspector = inspect(self.engine.sync_engine)
-            tables = inspector.get_table_names()
+        # 直接使用asyncpg连接池进行查询
+        async with self.db_manager.postgres_pool.acquire() as conn:
+            # 使用SQL查询获取表列表
+            rows = await conn.fetch(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+            )
+            tables = [row['tablename'] for row in rows]
             
             logger.info(f"现有表: {tables}")
             return tables
@@ -119,18 +122,18 @@ class DatabaseInitializer:
             
             # 创建检查点表
             logger.info("创建检查点表...")
-            checkpoint_saver = AsyncPostgresSaver.from_conn_string(
+            async with AsyncPostgresSaver.from_conn_string(
                 self.settings.database.postgres_uri
-            )
-            await checkpoint_saver.setup()
+            ) as checkpoint_saver:
+                await checkpoint_saver.setup()
             logger.info("检查点表创建完成")
             
             # 创建存储表（包含LangMem所需的store和store_vectors表）
             logger.info("创建存储表...")
-            store = AsyncPostgresStore.from_conn_string(
+            async with AsyncPostgresStore.from_conn_string(
                 self.settings.database.postgres_uri
-            )
-            await store.setup()
+            ) as store:
+                await store.setup()
             logger.info("存储表创建完成（包含LangMem所需的store和store_vectors表）")
             
         except Exception as e:

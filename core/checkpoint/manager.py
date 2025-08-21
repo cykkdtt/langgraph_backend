@@ -14,10 +14,11 @@ from typing import Dict, Any, Optional, List, AsyncContextManager
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic import BaseModel, Field
+from psycopg_pool import AsyncConnectionPool
 
 from config.settings import get_settings
 
@@ -56,6 +57,7 @@ class CheckpointManager:
         self.logger = logging.getLogger("checkpoint.manager")
         
         self._checkpointer: Optional[BaseCheckpointSaver] = None
+        self._checkpointer_context = None
         self._context_manager: Optional[AsyncContextManager] = None
         self._is_initialized = False
     
@@ -72,21 +74,42 @@ class CheckpointManager:
             self.logger.info(f"初始化检查点存储器: {self.storage_type}")
             
             if self.storage_type == "postgres":
-                self._context_manager = AsyncPostgresSaver.from_conn_string(
-                    self.settings.database.postgres_url
-                )
-                self._checkpointer = await self._context_manager.__aenter__()
+                try:
+                    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+                    
+                    postgres_uri = self.settings.database.async_url
+                    self.logger.info(f"连接PostgreSQL数据库: {postgres_uri.split('@')[-1] if '@' in postgres_uri else 'localhost'}")
+                    
+                    # 使用 from_conn_string 方法创建上下文管理器
+                    self._context_manager = AsyncPostgresSaver.from_conn_string(postgres_uri)
+                    self._checkpointer = await self._context_manager.__aenter__()
+                    
+                    self.logger.info(f"检查点存储器初始化成功: {type(self._checkpointer).__name__}")
+                    
+                except Exception as e:
+                    self.logger.error(f"PostgreSQL检查点存储器初始化失败: {e}")
+                    self.logger.warning("降级使用内存存储")
+                    
+                    # 降级到内存存储
+                    from langgraph.checkpoint.memory import MemorySaver
+                    self._checkpointer = MemorySaver()
+                    self.logger.info(f"检查点存储器初始化成功: {type(self._checkpointer).__name__}")
                 
-            elif self.storage_type == "memory":
-                self._checkpointer = MemorySaver()
+            elif self.storage_type == "sqlite":
+                # 使用SQLite存储
+                from langgraph.checkpoint.sqlite import SqliteSaver
+                
+                sqlite_path = self.settings.database.sqlite_path or "./checkpoints.db"
+                self._checkpointer = SqliteSaver.from_conn_string(f"sqlite:///{sqlite_path}")
+                
+                self.logger.info(f"检查点存储器初始化成功: {type(self._checkpointer).__name__}")
                 
             else:
-                raise ValueError(f"不支持的存储类型: {self.storage_type}")
-            
-            # 设置表结构（如果需要）
-            if hasattr(self._checkpointer, 'setup'):
-                await self._checkpointer.setup()
-                self.logger.info("检查点表结构初始化完成")
+                # 使用内存存储
+                from langgraph.checkpoint.memory import MemorySaver
+                self._checkpointer = MemorySaver()
+                
+                self.logger.info(f"检查点存储器初始化成功: {type(self._checkpointer).__name__}")
             
             self._is_initialized = True
             self.logger.info(f"检查点存储器初始化成功: {type(self._checkpointer).__name__}")
@@ -97,7 +120,7 @@ class CheckpointManager:
             self.logger.error(f"检查点存储器初始化失败: {e}")
             # 降级到内存存储
             if self.storage_type != "memory":
-                self.logger.info("降级使用内存存储")
+                self.logger.warning("PostgreSQL连接失败，降级使用内存存储")
                 self.storage_type = "memory"
                 self._checkpointer = MemorySaver()
                 self._is_initialized = True
@@ -332,14 +355,26 @@ class CheckpointManager:
     async def cleanup(self):
         """清理资源"""
         try:
+            # 清理PostgreSQL上下文管理器
+            if self._checkpointer_context:
+                await self._checkpointer_context.__aexit__(None, None, None)
+                self.logger.info("PostgreSQL检查点存储器资源清理完成")
+            
+            # 清理其他上下文管理器
             if self._context_manager:
                 await self._context_manager.__aexit__(None, None, None)
                 self.logger.info("检查点存储器资源清理完成")
+            
+            self.logger.info("检查点管理器清理完成")
+            
         except Exception as e:
-            self.logger.error(f"检查点存储器资源清理失败: {e}")
+            self.logger.error(f"检查点管理器清理失败: {e}")
         finally:
             self._checkpointer = None
+            self._checkpointer_context = None
             self._context_manager = None
+            if hasattr(self, '_connection_pool'):
+                self._connection_pool = None
             self._is_initialized = False
 
 

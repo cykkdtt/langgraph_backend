@@ -11,14 +11,24 @@ from datetime import datetime
 T = TypeVar('T')
 
 
-class BaseResponse(BaseModel):
+class BaseResponse(BaseModel, Generic[T]):
     """基础响应模型"""
     success: bool = Field(description="请求是否成功")
     message: str = Field(description="响应消息")
-    data: Optional[Dict[str, Any]] = Field(None, description="响应数据")
+    data: Optional[T] = Field(None, description="响应数据")
     error: Optional[str] = Field(None, description="错误信息")
     timestamp: datetime = Field(default_factory=datetime.utcnow, description="响应时间")
     request_id: Optional[str] = Field(None, description="请求ID")
+    
+    @classmethod
+    def success(cls, data: T = None, message: str = "操作成功") -> "BaseResponse[T]":
+        """创建成功响应"""
+        return cls(success=True, message=message, data=data)
+    
+    @classmethod
+    def error(cls, message: str, error: str = None) -> "BaseResponse[T]":
+        """创建错误响应"""
+        return cls(success=False, message=message, error=error)
 
 
 class SuccessResponse(BaseResponse):

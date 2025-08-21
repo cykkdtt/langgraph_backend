@@ -14,7 +14,8 @@ from pathlib import Path
 # 项目现有模块
 from core.memory.store_manager import MemoryStoreManager
 from core.agents.base import BaseAgent
-from models.chat_models import Message, ChatResponse
+from models.database_models import Message
+from models.chat_models import ChatResponse
 
 # LangMem 提示词优化 (需要安装)
 try:

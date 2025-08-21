@@ -16,7 +16,6 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from enum import Enum
 
-from langgraph.store.postgres import AsyncPostgresStore
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
@@ -129,21 +128,53 @@ class LangMemManager:
             self.logger.info(f"初始化记忆存储器: {self.storage_type}")
             
             if self.storage_type == "postgres":
-                self._context_manager = AsyncPostgresStore.from_conn_string(
-                    self.settings.database.postgres_url
-                )
-                self._store = await self._context_manager.__aenter__()
-                
-            elif self.storage_type == "memory":
-                self._store = InMemoryStore()
+                try:
+                    # 使用PostgreSQL存储
+                    from langgraph.store.postgres.aio import AsyncPostgresStore
+                    
+                    postgres_uri = self.settings.database.async_url
+                    self.logger.info(f"连接PostgreSQL存储: {postgres_uri.split('@')[-1] if '@' in postgres_uri else 'localhost'}")
+                    
+                    # 为LangMem添加独立的应用名称以避免冲突
+                    connection_params = [
+                        "application_name=langmem_store",
+                    ]
+                    
+                    if '?' in postgres_uri:
+                        langmem_uri = f"{postgres_uri}&{'&'.join(connection_params)}"
+                    else:
+                        langmem_uri = f"{postgres_uri}?{'&'.join(connection_params)}"
+                    
+                    # 使用 from_conn_string 方法创建上下文管理器
+                    self._context_manager = AsyncPostgresStore.from_conn_string(
+                        langmem_uri
+                    )
+                    self._store = await self._context_manager.__aenter__()
+                    
+                    # 设置存储表结构
+                    await self._store.setup()
+                    
+                    self.logger.info(f"LangMem存储器初始化成功: {type(self._store).__name__}")
+                    
+                except Exception as e:
+                    self.logger.error(f"PostgreSQL LangMem存储器初始化失败: {e}")
+                    self.logger.warning("降级使用内存存储")
+                    
+                    # 降级到内存存储
+                    from langgraph.store.memory import InMemoryStore
+                    self._store = InMemoryStore()
+                    self.storage_type = "memory"  # 更新存储类型
+                    self.logger.info(f"LangMem存储器初始化成功: {type(self._store).__name__}")
                 
             else:
-                raise ValueError(f"不支持的存储类型: {self.storage_type}")
-            
-            # 设置表结构（如果需要）
-            if hasattr(self._store, 'setup'):
-                await self._store.setup()
-                self.logger.info("记忆表结构初始化完成")
+                # 使用内存存储
+                self._store = InMemoryStore()
+                self.storage_type = "memory"
+                
+                # 设置表结构（如果需要）
+                if hasattr(self._store, 'setup'):
+                    await self._store.setup()
+                    self.logger.info("内存记忆表结构初始化完成")
             
             self._is_initialized = True
             self.logger.info(f"记忆存储器初始化成功: {type(self._store).__name__}")
@@ -225,20 +256,35 @@ class LangMemManager:
             return None
         
         # 更新访问统计
-        memory_data["access_count"] = memory_data.get("access_count", 0) + 1
-        memory_data["last_accessed"] = datetime.utcnow().isoformat()
-        await store.aput(namespace.to_tuple(), memory_id, memory_data)
+        if hasattr(memory_data, 'get'):
+            # memory_data是字典
+            memory_data["access_count"] = memory_data.get("access_count", 0) + 1
+            memory_data["last_accessed"] = datetime.utcnow().isoformat()
+            await store.aput(namespace.to_tuple(), memory_id, memory_data)
+        else:
+            # memory_data是Item对象，需要重新构造字典
+            data_dict = {
+                "content": getattr(memory_data, 'content', ''),
+                "memory_type": getattr(memory_data, 'memory_type', 'semantic'),
+                "metadata": getattr(memory_data, 'metadata', {}),
+                "timestamp": getattr(memory_data, 'timestamp', datetime.utcnow().isoformat()),
+                "importance": getattr(memory_data, 'importance', 0.5),
+                "access_count": getattr(memory_data, 'access_count', 0) + 1,
+                "last_accessed": datetime.utcnow().isoformat()
+            }
+            await store.aput(namespace.to_tuple(), memory_id, data_dict)
+            memory_data = data_dict
         
         # 构造记忆项
         return MemoryItem(
             id=memory_id,
-            content=memory_data["content"],
-            memory_type=MemoryType(memory_data["memory_type"]),
+            content=memory_data.get("content", ""),
+            memory_type=MemoryType(memory_data.get("memory_type", "semantic")),
             metadata=memory_data.get("metadata", {}),
-            timestamp=datetime.fromisoformat(memory_data["timestamp"]),
+            timestamp=datetime.fromisoformat(memory_data.get("timestamp")) if memory_data.get("timestamp") else datetime.utcnow(),
             importance=memory_data.get("importance", 0.5),
             access_count=memory_data.get("access_count", 0),
-            last_accessed=datetime.fromisoformat(memory_data["last_accessed"]) if memory_data.get("last_accessed") else None
+            last_accessed=datetime.fromisoformat(memory_data.get("last_accessed")) if memory_data.get("last_accessed") else None
         )
     
     async def search_memories(
@@ -255,40 +301,72 @@ class LangMemManager:
         Returns:
             List[MemoryItem]: 匹配的记忆项列表
         """
-        store = await self.get_store()
-        
-        memories = []
-        async for key, memory_data in store.asearch(namespace.to_tuple()):
-            # 构造记忆项
-            memory_item = MemoryItem(
-                id=key,
-                content=memory_data["content"],
-                memory_type=MemoryType(memory_data["memory_type"]),
-                metadata=memory_data.get("metadata", {}),
-                timestamp=datetime.fromisoformat(memory_data["timestamp"]),
-                importance=memory_data.get("importance", 0.5),
-                access_count=memory_data.get("access_count", 0),
-                last_accessed=datetime.fromisoformat(memory_data["last_accessed"]) if memory_data.get("last_accessed") else None
+        try:
+            store = await self.get_store()
+            
+            memories = []
+            # 使用await获取搜索结果，而不是async for
+            search_results = await store.asearch(namespace.to_tuple(), query=query.query, limit=query.limit * 2)  # 获取更多结果用于过滤
+            
+            for result in search_results:
+                try:
+                    # 从搜索结果中提取数据
+                    if hasattr(result, 'value'):
+                        memory_data = result.value
+                        key = result.key if hasattr(result, 'key') else str(len(memories))
+                    else:
+                        memory_data = result
+                        key = str(len(memories))
+                    
+                    # 构造记忆项
+                    memory_item = MemoryItem(
+                        id=key,
+                        content=memory_data.get("content", ""),
+                        memory_type=MemoryType(memory_data.get("memory_type", "semantic")),
+                        metadata=memory_data.get("metadata", {}),
+                        timestamp=datetime.fromisoformat(memory_data.get("timestamp")) if memory_data.get("timestamp") else datetime.utcnow(),
+                        importance=memory_data.get("importance", 0.5),
+                        access_count=memory_data.get("access_count", 0),
+                        last_accessed=datetime.fromisoformat(memory_data.get("last_accessed")) if memory_data.get("last_accessed") else None
+                    )
+                    
+                    # 应用过滤条件
+                    if query.memory_type and memory_item.memory_type != query.memory_type:
+                        continue
+                    
+                    if memory_item.importance < query.min_importance:
+                        continue
+                    
+                    memories.append(memory_item)
+                    
+                except Exception as item_error:
+                    self.logger.warning(f"处理记忆项时出错: {item_error}")
+                    continue
+            
+            # 按重要性和时间排序
+            memories.sort(
+                key=lambda x: (x.importance, x.timestamp), 
+                reverse=True
             )
             
-            # 应用过滤条件
-            if query.memory_type and memory_item.memory_type != query.memory_type:
-                continue
+            return memories[:query.limit]
             
-            if memory_item.importance < query.min_importance:
-                continue
+        except Exception as e:
+            # 检查是否是数据库连接相关的错误
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['connection', 'server closed', 'db_termination', 'shutdown']):
+                self.logger.warning(f"数据库连接异常，返回空记忆列表: {e}")
+                # 尝试重新初始化连接
+                try:
+                    self._is_initialized = False
+                    await self.initialize()
+                    self.logger.info("记忆存储连接已重新初始化")
+                except Exception as reinit_error:
+                    self.logger.error(f"重新初始化记忆存储失败: {reinit_error}")
+            else:
+                self.logger.error(f"搜索记忆时出错: {e}")
             
-            # 简单的文本匹配（实际应用中可以使用更复杂的语义搜索）
-            if query.query.lower() in memory_item.content.lower():
-                memories.append(memory_item)
-        
-        # 按重要性和时间排序
-        memories.sort(
-            key=lambda x: (x.importance, x.timestamp), 
-            reverse=True
-        )
-        
-        return memories[:query.limit]
+            return []
     
     async def update_memory(
         self, 
@@ -371,16 +449,27 @@ class LangMemManager:
         
         memories = []
         count = 0
-        async for key, memory_data in store.asearch(namespace.to_tuple()):
+        # 使用await获取所有记忆数据
+        search_results = await store.asearch(namespace.to_tuple())
+        
+        for result in search_results:
             if count >= limit:
                 break
             
+            # 从搜索结果中提取数据
+            if hasattr(result, 'value'):
+                memory_data = result.value
+                key = result.key if hasattr(result, 'key') else str(len(memories))
+            else:
+                memory_data = result
+                key = str(len(memories))
+            
             memory_item = MemoryItem(
                 id=key,
-                content=memory_data["content"],
-                memory_type=MemoryType(memory_data["memory_type"]),
+                content=memory_data.get("content", ""),
+                memory_type=MemoryType(memory_data.get("memory_type", "semantic")),
                 metadata=memory_data.get("metadata", {}),
-                timestamp=datetime.fromisoformat(memory_data["timestamp"]),
+                timestamp=datetime.fromisoformat(memory_data["timestamp"]) if memory_data.get("timestamp") else datetime.utcnow(),
                 importance=memory_data.get("importance", 0.5),
                 access_count=memory_data.get("access_count", 0),
                 last_accessed=datetime.fromisoformat(memory_data["last_accessed"]) if memory_data.get("last_accessed") else None
@@ -482,18 +571,43 @@ class LangMemManager:
             self.logger.error(f"清理记忆失败: {e}")
             return 0
     
-    async def cleanup(self):
+    async def cleanup(self) -> None:
         """清理资源"""
         try:
+            # 如果使用PostgreSQL存储，需要退出上下文管理器
             if self._context_manager:
-                await self._context_manager.__aexit__(None, None, None)
-                self.logger.info("记忆存储器资源清理完成")
+                try:
+                    # 添加超时控制，避免长时间等待
+                    await asyncio.wait_for(
+                        self._context_manager.__aexit__(None, None, None),
+                        timeout=5.0  # 5秒超时
+                    )
+                    self.logger.info("PostgreSQL记忆存储上下文已关闭")
+                except asyncio.TimeoutError:
+                    self.logger.warning("PostgreSQL记忆存储关闭超时，强制清理")
+                except Exception as close_error:
+                    self.logger.warning(f"PostgreSQL记忆存储关闭时出错: {close_error}")
+                    
+            elif self._store and hasattr(self._store, 'close'):
+                try:
+                    await asyncio.wait_for(
+                        self._store.close(),
+                        timeout=3.0  # 3秒超时
+                    )
+                    self.logger.info("记忆存储连接已关闭")
+                except asyncio.TimeoutError:
+                    self.logger.warning("记忆存储关闭超时，强制清理")
+                except Exception as close_error:
+                    self.logger.warning(f"记忆存储关闭时出错: {close_error}")
+                    
         except Exception as e:
-            self.logger.error(f"记忆存储器资源清理失败: {e}")
+            self.logger.error(f"清理记忆存储资源时出错: {e}")
         finally:
+            # 确保资源被清理
             self._store = None
             self._context_manager = None
             self._is_initialized = False
+            self.logger.info("记忆存储资源清理完成")
 
 
 # 全局记忆管理器实例

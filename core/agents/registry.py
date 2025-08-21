@@ -13,27 +13,34 @@ from typing import Dict, Any, Optional, List, Type, Union
 from datetime import datetime
 from abc import ABC, abstractmethod
 import uuid
+import os
 
 from pydantic import BaseModel, Field
 from langchain_core.language_models import BaseLanguageModel
 from langchain_core.tools import BaseTool
+from langchain_deepseek import ChatDeepSeek
+from langchain_openai import ChatOpenAI
+from langchain_community.chat_models.tongyi import ChatTongyi
 
-from .base import BaseAgent, AgentType, AgentStatus, AgentMetadata, ChatRequest, ChatResponse
+from .base import BaseAgent, AgentType, AgentStatus, AgentMetadata
+from .background_memory_manager import BackgroundMemoryManager
 from config.settings import get_settings
 
 
 class AgentConfig(BaseModel):
     """智能体配置模型"""
     agent_type: AgentType = Field(description="智能体类型")
+    agent_id: Optional[str] = Field(default=None, description="智能体ID")
     name: str = Field(description="智能体名称")
     description: str = Field(description="智能体描述")
     version: str = Field(default="1.0.0", description="版本号")
     
     # 模型配置
     llm_config: Dict[str, Any] = Field(default_factory=dict, description="LLM配置")
+    llm: Optional[BaseLanguageModel] = Field(default=None, description="LLM实例")
     
     # 工具配置
-    tools: List[str] = Field(default_factory=list, description="工具列表")
+    tools: List[Any] = Field(default_factory=list, description="工具列表")
     tool_permissions: Dict[str, List[str]] = Field(default_factory=dict, description="工具权限")
     
     # 能力配置
@@ -51,8 +58,14 @@ class AgentConfig(BaseModel):
     max_iterations: int = Field(default=10, description="最大迭代次数")
     timeout: int = Field(default=300, description="超时时间(秒)")
     
+    # 检查点配置
+    checkpointer: Optional[Any] = Field(default=None, description="检查点管理器")
+    
     # 自定义配置
     custom_config: Dict[str, Any] = Field(default_factory=dict, description="自定义配置")
+    
+    class Config:
+        arbitrary_types_allowed = True  # 允许任意类型，用于 LLM 实例
 
 
 class AgentInstance(BaseModel):
@@ -88,6 +101,9 @@ class AgentRegistry:
         self._agent_configs: Dict[AgentType, AgentConfig] = {}
         self._logger = logging.getLogger("agent.registry")
         
+        # 初始化后台记忆管理器
+        self._memory_manager = BackgroundMemoryManager()
+        
         # 初始化默认配置
         self._initialize_default_configs()
     
@@ -98,7 +114,7 @@ class AgentRegistry:
         # 注册智能体类
         self._register_agent_classes()
         
-        # Supervisor智能体配置
+        # Supervisor智能体配置 - 启用记忆功能
         self._agent_configs[AgentType.SUPERVISOR] = AgentConfig(
             agent_type=AgentType.SUPERVISOR,
             name="Supervisor Agent",
@@ -108,13 +124,15 @@ class AgentRegistry:
                 "temperature": 0.7,
                 "max_tokens": 2000
             },
-            tools=["handoff_to_research", "handoff_to_chart", "task_coordinator"],
+            tools=[],  # 工具将在智能体初始化时动态添加
             capabilities=["task_coordination", "result_integration", "decision_making"],
             collaboration_enabled=True,
-            handoff_targets=["research", "chart"]
+            handoff_targets=["research", "chart"],
+            memory_enabled=True,  # Supervisor 需要记忆功能来协调工作流程
+            memory_namespace="supervisor_agent"  # 独立的命名空间用于Supervisor智能体记忆
         )
         
-        # Research智能体配置
+        # Research智能体配置 - 不启用记忆功能
         self._agent_configs[AgentType.RESEARCH] = AgentConfig(
             agent_type=AgentType.RESEARCH,
             name="Research Agent",
@@ -127,10 +145,11 @@ class AgentRegistry:
             tools=["google_search", "web_scraper", "document_analyzer"],
             capabilities=["information_search", "data_analysis", "report_generation"],
             collaboration_enabled=True,
-            handoff_targets=["supervisor", "chart"]
+            handoff_targets=["supervisor", "chart"],
+            memory_enabled=False  # Research智能体不需要记忆功能
         )
         
-        # Chart智能体配置
+        # Chart智能体配置 - 不启用记忆功能
         self._agent_configs[AgentType.CHART] = AgentConfig(
             agent_type=AgentType.CHART,
             name="Chart Agent", 
@@ -143,10 +162,11 @@ class AgentRegistry:
             tools=["mcp_chart_tools", "data_processor", "visualization_engine"],
             capabilities=["data_visualization", "chart_generation", "statistical_analysis"],
             collaboration_enabled=True,
-            handoff_targets=["supervisor", "research"]
+            handoff_targets=["supervisor", "research"],
+            memory_enabled=False  # Chart智能体不需要记忆功能
         )
         
-        # RAG智能体配置
+        # RAG智能体配置 - 启用记忆功能
         self._agent_configs[AgentType.RAG] = AgentConfig(
             agent_type=AgentType.RAG,
             name="RAG Agent",
@@ -158,10 +178,11 @@ class AgentRegistry:
             },
             tools=["vector_search", "document_retrieval", "knowledge_base"],
             capabilities=["knowledge_retrieval", "context_generation", "qa_generation"],
-            memory_enabled=True
+            memory_enabled=True,
+            memory_namespace="rag_agent"  # 独立的命名空间用于RAG智能体记忆
         )
         
-        # Code智能体配置
+        # Code智能体配置 - 不启用记忆功能
         self._agent_configs[AgentType.CODE] = AgentConfig(
             agent_type=AgentType.CODE,
             name="Code Agent",
@@ -173,25 +194,39 @@ class AgentRegistry:
             },
             tools=["code_executor", "syntax_analyzer", "code_formatter"],
             capabilities=["code_generation", "code_analysis", "code_optimization"],
-            memory_enabled=True
+            memory_enabled=False  # 代码智能体不需要记忆功能
         )
         
         # 注册智能体类
         self._register_agent_classes()
     
     def _register_agent_classes(self):
-        """注册智能体类"""
+        """注册智能体类
+        
+        根据 LangMem 最佳实践，只有需要记忆功能的智能体才使用 MemoryEnhancedAgent。
+        其他智能体使用 BaseAgent 以避免不必要的性能开销。
+        """
         try:
-            # 导入记忆增强智能体
+            # 导入智能体类
+            from .base import BaseAgent
             from .memory_enhanced import MemoryEnhancedAgent
             
-            # 注册所有智能体类型使用MemoryEnhancedAgent
+            # 定义需要记忆功能的智能体类型
+            memory_enabled_agents = {AgentType.SUPERVISOR, AgentType.RAG}
+            
+            # 注册智能体类
             for agent_type in [AgentType.SUPERVISOR, AgentType.RESEARCH, AgentType.CHART, AgentType.RAG, AgentType.CODE]:
-                self._agent_classes[agent_type] = MemoryEnhancedAgent
-                self._logger.info(f"注册智能体类: {agent_type.value} -> MemoryEnhancedAgent")
+                if agent_type in memory_enabled_agents:
+                    # 需要记忆功能的智能体使用 MemoryEnhancedAgent
+                    self._agent_classes[agent_type] = MemoryEnhancedAgent
+                    self._logger.info(f"注册记忆增强智能体: {agent_type.value} -> MemoryEnhancedAgent")
+                else:
+                    # 其他智能体使用 BaseAgent
+                    self._agent_classes[agent_type] = BaseAgent
+                    self._logger.info(f"注册基础智能体: {agent_type.value} -> BaseAgent")
             
         except ImportError as e:
-            self._logger.warning(f"无法导入MemoryEnhancedAgent: {e}")
+            self._logger.warning(f"无法导入智能体类: {e}")
             # 回退到基础智能体
             from .base import BaseAgent
             for agent_type in [AgentType.SUPERVISOR, AgentType.RESEARCH, AgentType.CHART, AgentType.RAG, AgentType.CODE]:
@@ -243,6 +278,10 @@ class AgentRegistry:
         """
         return self._agent_configs.get(agent_type)
     
+    def get_memory_manager(self) -> BackgroundMemoryManager:
+        """获取后台记忆管理器"""
+        return self._memory_manager
+    
     def list_agent_types(self) -> List[AgentType]:
         """列出所有注册的智能体类型
         
@@ -284,6 +323,8 @@ class AgentFactory:
         self._instances: Dict[str, AgentInstance] = {}
         self._agents: Dict[str, BaseAgent] = {}
         self._logger = logging.getLogger("agent.factory")
+    
+
     
     async def create_agent(
         self,
@@ -352,7 +393,7 @@ class AgentFactory:
             # 更新实例状态
             instance.status = AgentStatus.READY
             
-            self._logger.info(f"创建智能体实例: {agent_type.value} (ID: {instance_id})")
+            self._logger.info(f"创建智能体实例: {agent_type} (ID: {instance_id})")
             
             return instance_id
             
@@ -378,25 +419,104 @@ class AgentFactory:
             # 生成唯一的智能体ID
             agent_id = f"{config.agent_type.value}_{uuid.uuid4().hex[:8]}"
             
-            # 准备智能体初始化参数
-            init_params = {
-                "agent_id": agent_id,
-                "name": config.name,
-                "description": config.description,
-                "llm": None,  # 这里需要根据llm_config创建LLM实例
-                "tools": config.tools or [],
-                "checkpointer": None,  # 可以根据需要配置
-                "memory_config": config.custom_config.get("memory_config", {}) if config.custom_config else {}
-            }
+            # 根据llm_config创建LLM实例
+            llm = self._create_llm_instance(config.llm_config)
             
-            # 创建智能体实例
-            agent = agent_class(**init_params)
+            # 更新配置对象中的动态生成字段
+            config.agent_id = agent_id
+            config.llm = llm
+            config.checkpointer = None  # 可以根据需要配置
+            
+            # 为启用记忆功能的智能体传递记忆管理器
+            if config.memory_enabled:
+                # 创建智能体实例，传递记忆管理器
+                agent = agent_class(config=config, memory_manager=self.registry.get_memory_manager())
+            else:
+                # 创建智能体实例，不传递记忆管理器
+                agent = agent_class(config=config)
             
             return agent
             
         except Exception as e:
             self._logger.error(f"实例化智能体失败: {e}")
             raise
+    
+    def _create_llm_instance(self, llm_config: Dict[str, Any]):
+        """根据配置创建LLM实例
+        
+        Args:
+            llm_config: LLM配置字典
+            
+        Returns:
+            LLM实例
+        """
+        try:
+            # 获取模型类型，默认使用deepseek
+            model_type = llm_config.get("model_type", "deepseek-chat")
+            temperature = llm_config.get("temperature", 0.7)
+            max_tokens = llm_config.get("max_tokens", 2000)
+            
+            # 根据模型类型创建相应的LLM实例
+            if "deepseek" in model_type.lower():
+                # 使用DeepSeek模型
+                api_key = os.getenv("DEEPSEEK_API_KEY")
+                if not api_key:
+                    self._logger.warning("DEEPSEEK_API_KEY未设置，LLM将无法正常工作")
+                    return None
+                
+                return ChatDeepSeek(
+                    model="deepseek-chat",
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    api_key=api_key
+                )
+            
+            elif "gpt" in model_type.lower() or "openai" in model_type.lower():
+                # 使用OpenAI模型
+                api_key = os.getenv("OPENAI_API_KEY")
+                if not api_key:
+                    self._logger.warning("OPENAI_API_KEY未设置，LLM将无法正常工作")
+                    return None
+                
+                return ChatOpenAI(
+                    model=model_type if "gpt" in model_type else "gpt-3.5-turbo",
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    api_key=api_key
+                )
+            
+            elif "tongyi" in model_type.lower():
+                # 使用通义千问模型
+                api_key = os.getenv("TONGYI_API_KEY")
+                if not api_key:
+                    self._logger.warning("TONGYI_API_KEY未设置，LLM将无法正常工作")
+                    return None
+                
+                return ChatTongyi(
+                    model="qwen-turbo",
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    dashscope_api_key=api_key
+                )
+            
+            else:
+                # 默认使用DeepSeek
+                self._logger.info(f"未知模型类型 {model_type}，使用默认的DeepSeek模型")
+                api_key = os.getenv("DEEPSEEK_API_KEY")
+                if not api_key:
+                    self._logger.warning("DEEPSEEK_API_KEY未设置，LLM将无法正常工作")
+                    return None
+                
+                return ChatDeepSeek(
+                    model="deepseek-chat",
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    api_key=api_key
+                )
+                
+        except Exception as e:
+            self._logger.error(f"创建LLM实例失败: {e}")
+            return None
     
     async def get_agent(self, instance_id: str) -> Optional[BaseAgent]:
         """获取智能体实例

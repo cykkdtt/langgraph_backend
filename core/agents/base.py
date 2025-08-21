@@ -105,32 +105,23 @@ class BaseAgent:
     
     def __init__(
         self,
-        agent_id: str,
-        name: str,
-        description: str,
-        llm,
-        tools: Optional[List] = None,
-        checkpointer=None,
+        config,
         **kwargs
     ):
         """初始化智能体
         
         Args:
-            agent_id: 智能体ID
-            name: 智能体名称
-            description: 智能体描述
-            llm: 语言模型
-            tools: 工具列表
-            checkpointer: 检查点保存器
+            config: 智能体配置对象，包含所有必要的配置信息
             **kwargs: 其他参数
         """
-        self.agent_id = agent_id
-        self.name = name
-        self.description = description
-        self.llm = llm
-        self.tools = tools or []
-        self.checkpointer = checkpointer
-        self.config = kwargs
+        # 从配置对象中提取基本信息
+        self.agent_id = config.agent_id
+        self.name = config.name
+        self.description = config.description
+        self.llm = config.llm
+        self.tools = config.tools or []
+        self.checkpointer = config.checkpointer
+        self.config = config
         
         # 状态和图
         self.graph: Optional[StateGraph] = None
@@ -139,11 +130,11 @@ class BaseAgent:
         
         # 元数据
         self.metadata = AgentMetadata(
-            agent_id=agent_id,
-            agent_type=kwargs.get("agent_type", AgentType.CODE),
-            name=name,
-            description=description,
-            tools=[tool.__name__ if hasattr(tool, '__name__') else str(tool) for tool in self.tools]
+            agent_id=self.agent_id,
+            agent_type=getattr(config, 'agent_type', AgentType.CODE),
+            name=self.name,
+            description=self.description,
+            tools=[getattr(tool, 'name', str(tool)) for tool in self.tools]
         )
         
         self.logger = logging.getLogger(f"agent.{self.agent_id}")
@@ -201,19 +192,29 @@ class BaseAgent:
     
     async def chat(
         self,
-        request: ChatRequest,
+        request,  # 使用通用类型，支持不同的ChatRequest格式
         config: Optional[RunnableConfig] = None
     ) -> ChatResponse:
         """处理对话请求"""
         if not self.initialized:
             await self.initialize()
         
+        # 适配不同的ChatRequest格式
+        if hasattr(request, 'messages'):
+            # core.agents.base.ChatRequest格式
+            messages = request.messages
+        elif hasattr(request, 'message'):
+            # models.chat_models.ChatRequest格式
+            messages = [HumanMessage(content=request.message)]
+        else:
+            raise ValueError("不支持的ChatRequest格式")
+        
         # 准备状态
         state = AgentState(
-            messages=request.messages,
+            messages=messages,
             user_id=request.user_id,
             session_id=request.session_id,
-            metadata=request.metadata
+            metadata=getattr(request, 'metadata', {})
         )
         
         # 执行图
@@ -232,19 +233,29 @@ class BaseAgent:
     
     async def stream_chat(
         self,
-        request: ChatRequest,
+        request,  # 使用通用类型，支持不同的ChatRequest格式
         config: Optional[RunnableConfig] = None
     ) -> AsyncGenerator[StreamChunk, None]:
         """流式处理对话请求"""
         if not self.initialized:
             await self.initialize()
         
+        # 适配不同的ChatRequest格式
+        if hasattr(request, 'messages'):
+            # core.agents.base.ChatRequest格式
+            messages = request.messages
+        elif hasattr(request, 'message'):
+            # models.chat_models.ChatRequest格式
+            messages = [HumanMessage(content=request.message)]
+        else:
+            raise ValueError("不支持的ChatRequest格式")
+        
         # 准备状态
         state = AgentState(
-            messages=request.messages,
+            messages=messages,
             user_id=request.user_id,
             session_id=request.session_id,
-            metadata=request.metadata
+            metadata=getattr(request, 'metadata', {})
         )
         
         # 流式执行图
@@ -277,7 +288,7 @@ class BaseAgent:
             "agent_id": self.metadata.agent_id,
             "agent_type": self.metadata.agent_type.value,
             "status": self.metadata.status.value,
-            "is_initialized": self._is_initialized,
+            "is_initialized": self.initialized,
             "uptime": (datetime.utcnow() - self.metadata.created_at).total_seconds(),
             "capabilities_count": len(self.metadata.capabilities),
             "tools_count": len(self.metadata.tools)

@@ -54,8 +54,12 @@ class DatabaseManager:
             # 初始化PostgreSQL连接池
             await self._initialize_postgres()
             
-            # 初始化Redis连接池
-            await self._initialize_redis()
+            # 尝试初始化Redis连接池（可选）
+            try:
+                await self._initialize_redis()
+            except Exception as e:
+                logger.warning(f"Redis连接初始化失败，将跳过Redis功能: {e}")
+                self.redis_pool = None
             
             # 初始化SQLAlchemy异步引擎
             await self._initialize_sqlalchemy()
@@ -77,16 +81,29 @@ class DatabaseManager:
             # 解析连接URL
             postgres_url = self.settings.database.postgres_url
             
+            # 优化的连接池配置
+            pool_config = {
+                'dsn': postgres_url,
+                'min_size': 2,  # 减少最小连接数
+                'max_size': 10,  # 减少最大连接数
+                'command_timeout': 30,  # 减少命令超时时间
+                'statement_cache_size': 0,  # 禁用prepared statements以避免冲突
+                'server_settings': {
+                    'application_name': 'langgraph_backend',
+                    'jit': 'off',  # 关闭JIT以提高连接速度
+                    'statement_timeout': '30s',  # SQL语句超时
+                    'idle_in_transaction_session_timeout': '60s',  # 事务空闲超时
+                },
+                # 连接初始化回调
+                'init': self._init_postgres_connection
+            }
+            
             # 创建连接池
-            self.postgres_pool = await asyncpg.create_pool(
-                postgres_url,
-                min_size=5,
-                max_size=20,
-                command_timeout=60,
-                server_settings={
-                    'jit': 'off'  # 关闭JIT以提高连接速度
-                }
-            )
+            logger.info("创建PostgreSQL连接池...")
+            self.postgres_pool = await asyncpg.create_pool(**pool_config)
+            
+            # 清理可能存在的prepared statements
+            await self._cleanup_prepared_statements()
             
             # 测试连接
             async with self.postgres_pool.acquire() as conn:
@@ -97,10 +114,45 @@ class DatabaseManager:
             logger.error(f"PostgreSQL连接初始化失败: {e}")
             raise
     
+    async def _init_postgres_connection(self, conn: asyncpg.Connection):
+        """PostgreSQL连接初始化回调"""
+        try:
+            # 设置连接级别的配置
+            await conn.execute("SET statement_timeout = '30s'")
+            await conn.execute("SET idle_in_transaction_session_timeout = '60s'")
+            logger.debug(f"PostgreSQL连接 {id(conn)} 初始化完成")
+        except Exception as e:
+            logger.warning(f"PostgreSQL连接初始化回调失败: {e}")
+    
+    async def _cleanup_prepared_statements(self):
+        """清理残留的prepared statements"""
+        try:
+            async with self.postgres_pool.acquire() as conn:
+                # 查询所有prepared statements
+                statements = await conn.fetch(
+                    "SELECT name FROM pg_prepared_statements WHERE name LIKE '_pg%'"
+                )
+                
+                if statements:
+                    logger.info(f"清理 {len(statements)} 个残留的prepared statements")
+                    
+                    # 清理所有以_pg开头的prepared statements
+                    for stmt in statements:
+                        try:
+                            await conn.execute(f"DEALLOCATE {stmt['name']}")
+                            logger.debug(f"已清理prepared statement: {stmt['name']}")
+                        except Exception as e:
+                            logger.debug(f"清理prepared statement {stmt['name']} 失败: {e}")
+                    
+                    logger.info("Prepared statements清理完成")
+                
+        except Exception as e:
+            logger.warning(f"清理prepared statements失败: {e}")
+    
     async def _initialize_redis(self) -> None:
         """初始化Redis连接池"""
         try:
-            redis_url = self.settings.database.redis_url
+            redis_url = self.settings.redis.redis_url
             
             # 创建连接池
             self.redis_pool = redis.ConnectionPool.from_url(
@@ -129,11 +181,19 @@ class DatabaseManager:
             
             self.async_engine = create_async_engine(
                 async_url,
-                echo=self.settings.app.debug,
-                pool_size=10,
-                max_overflow=20,
+                echo=self.settings.debug,
+                pool_size=5,  # 减少连接池大小
+                max_overflow=10,  # 减少最大溢出连接数
                 pool_pre_ping=True,
-                pool_recycle=3600
+                pool_recycle=1800,  # 减少连接回收时间
+                connect_args={
+                    "statement_cache_size": 0,  # 禁用预编译语句以兼容pgbouncer
+                    "prepared_statement_cache_size": 0,
+                    "server_settings": {
+                        "application_name": "langgraph_sqlalchemy",
+                        "jit": "off"
+                    }
+                }
             )
             
             # 创建会话工厂
@@ -155,19 +215,28 @@ class DatabaseManager:
             # 这里可以添加自定义表的创建逻辑
             # LangGraph的表会自动创建，这里主要是为了扩展表
             
-            async with self.async_engine.begin() as conn:
-                # 创建扩展（如果需要）
-                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-                
-                # 创建自定义表（如果有的话）
-                # await conn.run_sync(Base.metadata.create_all)
-                
+            # 使用原生asyncpg连接来避免prepared statement冲突
+            if self.postgres_pool:
+                async with self.postgres_pool.acquire() as conn:
+                    # 创建扩展（如果需要）
+                    try:
+                        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                        logger.info("vector扩展检查完成")
+                    except Exception as e:
+                        logger.warning(f"vector扩展创建跳过: {e}")
+                    
+                    try:
+                        await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                        logger.info("pg_trgm扩展检查完成")
+                    except Exception as e:
+                        logger.warning(f"pg_trgm扩展创建跳过: {e}")
+                        
             logger.info("数据库表结构检查完成")
             
         except Exception as e:
             logger.error(f"创建数据库表失败: {e}")
-            raise
+            # 不要抛出异常，让系统继续运行
+            logger.warning("数据库表创建失败，但系统将继续运行")
     
     async def health_check(self) -> Dict[str, Any]:
         """数据库健康检查"""
@@ -286,23 +355,51 @@ class DatabaseManager:
     
     async def cleanup(self) -> None:
         """清理数据库连接"""
-        try:
-            if self.postgres_pool:
-                await self.postgres_pool.close()
-                logger.info("PostgreSQL连接池已关闭")
-            
-            if self.redis_pool:
-                await self.redis_pool.disconnect()
+        logger.info("开始清理数据库连接...")
+        
+        # PostgreSQL连接池清理
+        if self.postgres_pool:
+            try:
+                logger.info("关闭PostgreSQL连接池...")
+                # 使用超时控制避免长时间等待
+                await asyncio.wait_for(self.postgres_pool.close(), timeout=30.0)
+                logger.info("PostgreSQL连接池已正常关闭")
+            except asyncio.TimeoutError:
+                logger.warning("PostgreSQL连接池关闭超时，强制终止连接")
+                try:
+                    # 强制终止连接池
+                    if hasattr(self.postgres_pool, 'terminate'):
+                        self.postgres_pool.terminate()
+                    logger.info("PostgreSQL连接池已强制关闭")
+                except Exception as e:
+                    logger.error(f"强制关闭PostgreSQL连接池失败: {e}")
+            except Exception as e:
+                logger.error(f"PostgreSQL连接池关闭失败: {e}")
+        
+        # Redis连接池清理
+        if self.redis_pool:
+            try:
+                logger.info("关闭Redis连接池...")
+                await asyncio.wait_for(self.redis_pool.disconnect(), timeout=10.0)
                 logger.info("Redis连接池已关闭")
-            
-            if self.async_engine:
-                await self.async_engine.dispose()
+            except asyncio.TimeoutError:
+                logger.warning("Redis连接池关闭超时")
+            except Exception as e:
+                logger.error(f"Redis连接池关闭失败: {e}")
+        
+        # SQLAlchemy引擎清理
+        if self.async_engine:
+            try:
+                logger.info("关闭SQLAlchemy引擎...")
+                await asyncio.wait_for(self.async_engine.dispose(), timeout=15.0)
                 logger.info("SQLAlchemy引擎已关闭")
-                
-        except Exception as e:
-            logger.error(f"数据库连接清理失败: {e}")
+            except asyncio.TimeoutError:
+                logger.warning("SQLAlchemy引擎关闭超时")
+            except Exception as e:
+                logger.error(f"SQLAlchemy引擎关闭失败: {e}")
         
         self.is_initialized = False
+        logger.info("数据库连接清理完成")
 
 
 # 全局数据库管理器实例

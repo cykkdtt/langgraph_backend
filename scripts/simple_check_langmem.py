@@ -37,7 +37,7 @@ async def simple_check() -> Dict[str, Any]:
     conn = None
     try:
         # 直接连接到PostgreSQL
-        postgres_url = settings.database.postgres_url
+        postgres_url = settings.database.url
         logger.info(f"连接到数据库: {postgres_url.split('@')[1] if '@' in postgres_url else 'localhost'}")
         
         conn = await asyncpg.connect(postgres_url)

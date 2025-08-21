@@ -42,7 +42,7 @@ class SimpleDatabaseInitializer:
         logger.info("连接PostgreSQL数据库...")
         
         # 从URI中提取连接参数
-        uri = self.settings.database.postgres_url
+        uri = self.settings.database.async_url
         self.conn = await asyncpg.connect(uri)
         
         # 测试连接
@@ -100,7 +100,7 @@ class SimpleDatabaseInitializer:
             # 创建检查点表
             logger.info("创建检查点表...")
             async with AsyncPostgresSaver.from_conn_string(
-                self.settings.database.postgres_url
+                self.settings.database.async_url
             ) as checkpoint_saver:
                 await checkpoint_saver.setup()
             logger.info("检查点表创建完成")
@@ -117,7 +117,7 @@ class SimpleDatabaseInitializer:
             }
             
             async with AsyncPostgresStore.from_conn_string(
-                self.settings.database.postgres_url,
+                self.settings.database.async_url,
                 index=index_config
             ) as store:
                 await store.setup()

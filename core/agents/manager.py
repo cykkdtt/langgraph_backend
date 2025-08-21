@@ -16,7 +16,9 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
-from .base import BaseAgent, AgentType, AgentStatus, ChatRequest, ChatResponse, StreamChunk
+from .base import BaseAgent, AgentType, AgentStatus, ChatResponse, StreamChunk, ChatRequest as BaseChatRequest
+from models.chat_models import ChatRequest
+from langchain_core.messages import HumanMessage
 from .registry import AgentRegistry, AgentFactory, AgentInstance, get_agent_registry, get_agent_factory
 from core.memory import get_memory_manager
 from core.tools import get_tool_registry
@@ -186,13 +188,13 @@ class AgentManager:
     async def process_message(
         self,
         instance_id: str,
-        request: ChatRequest
+        request  # 支持不同格式的ChatRequest
     ) -> ChatResponse:
         """处理消息
         
         Args:
             instance_id: 实例ID
-            request: 聊天请求
+            request: 聊天请求（支持models.chat_models.ChatRequest或core.agents.base.ChatRequest格式）
             
         Returns:
             聊天响应
@@ -205,8 +207,24 @@ class AgentManager:
             if not agent:
                 raise ValueError(f"智能体实例不存在: {instance_id}")
             
+            # 转换请求格式为core.agents.base.ChatRequest
+            if hasattr(request, 'message'):
+                # models.chat_models.ChatRequest格式 -> core.agents.base.ChatRequest格式
+                base_request = BaseChatRequest(
+                    messages=[HumanMessage(content=request.message)],
+                    user_id=request.user_id,
+                    session_id=request.session_id,
+                    stream=getattr(request, 'stream', False),
+                    metadata=getattr(request, 'metadata', {})
+                )
+            elif hasattr(request, 'messages'):
+                # 已经是core.agents.base.ChatRequest格式
+                base_request = request
+            else:
+                raise ValueError("不支持的ChatRequest格式")
+            
             # 处理消息
-            response = await agent.chat(request)
+            response = await agent.chat(base_request)
             
             # 更新性能指标
             await self._update_performance_metrics(
@@ -231,13 +249,13 @@ class AgentManager:
     async def stream_message(
         self,
         instance_id: str,
-        request: ChatRequest
+        request  # 支持不同格式的ChatRequest
     ):
         """流式处理消息
         
         Args:
             instance_id: 实例ID
-            request: 聊天请求
+            request: 聊天请求（支持models.chat_models.ChatRequest或core.agents.base.ChatRequest格式）
             
         Yields:
             流式响应块
@@ -250,8 +268,24 @@ class AgentManager:
             if not agent:
                 raise ValueError(f"智能体实例不存在: {instance_id}")
             
+            # 转换请求格式为core.agents.base.ChatRequest
+            if hasattr(request, 'message'):
+                # models.chat_models.ChatRequest格式 -> core.agents.base.ChatRequest格式
+                base_request = BaseChatRequest(
+                    messages=[HumanMessage(content=request.message)],
+                    user_id=request.user_id,
+                    session_id=request.session_id,
+                    stream=True,
+                    metadata=getattr(request, 'metadata', {})
+                )
+            elif hasattr(request, 'messages'):
+                # 已经是core.agents.base.ChatRequest格式
+                base_request = request
+            else:
+                raise ValueError("不支持的ChatRequest格式")
+            
             # 流式处理消息
-            async for chunk in agent.astream(request):
+            async for chunk in agent.astream(base_request):
                 yield chunk
             
             # 更新性能指标
@@ -427,8 +461,13 @@ class AgentManager:
                     # 检查智能体健康状态
                     try:
                         health = await agent.health_check()
-                        if not health.get("healthy", False):
-                            self._logger.warning(f"智能体实例不健康: {instance.instance_id}")
+                        # 检查智能体是否已初始化和状态是否正常
+                        is_healthy = (
+                            health.get("is_initialized", False) and 
+                            health.get("status") in ["ready", "idle"]
+                        )
+                        if not is_healthy:
+                            self._logger.warning(f"智能体实例不健康: {instance.instance_id}, 状态: {health.get('status')}, 已初始化: {health.get('is_initialized')}")
                     except Exception as e:
                         self._logger.error(f"智能体健康检查失败: {instance.instance_id}, {e}")
             

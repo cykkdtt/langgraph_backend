@@ -79,14 +79,14 @@ class LoggerManager:
         
         # 配置根日志器
         root_logger = logging.getLogger()
-        root_logger.setLevel(getattr(logging, self.settings.logging.log_level.upper()))
+        root_logger.setLevel(getattr(logging, self.settings.monitoring.log_level.upper()))
         
         # 清除现有处理器
         root_logger.handlers.clear()
         
         # 创建格式化器
         formatter = StructuredFormatter(
-            json_format=self.settings.logging.log_json_format
+            json_format=getattr(self.settings.monitoring, 'log_json_format', False)
         )
         
         # 控制台处理器
@@ -95,7 +95,7 @@ class LoggerManager:
         root_logger.addHandler(console_handler)
         
         # 文件处理器（如果配置了日志文件）
-        if self.settings.logging.log_file:
+        if self.settings.monitoring.log_file:
             self._setup_file_handler(root_logger, formatter)
         
         # 设置第三方库日志级别
@@ -106,14 +106,14 @@ class LoggerManager:
     
     def _setup_file_handler(self, logger: logging.Logger, formatter: logging.Formatter) -> None:
         """设置文件处理器"""
-        log_file = Path(self.settings.logging.log_file)
+        log_file = Path(self.settings.monitoring.log_file)
         log_file.parent.mkdir(parents=True, exist_ok=True)
         
         # 使用轮转文件处理器
         file_handler = logging.handlers.RotatingFileHandler(
             filename=log_file,
-            maxBytes=self.settings.logging.log_max_size,
-            backupCount=self.settings.logging.log_backup_count,
+            maxBytes=self.settings.monitoring.log_max_size,
+            backupCount=self.settings.monitoring.log_backup_count,
             encoding='utf-8'
         )
         file_handler.setFormatter(formatter)

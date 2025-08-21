@@ -166,9 +166,10 @@ async def test_memory_enhanced_agent():
         
         # 创建语言模型
         llm = ChatOpenAI(
-            model="gpt-4o-mini",
+            model="qwen-turbo",
             temperature=0.7,
-            api_key=settings.openai.api_key
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
         
         # 创建记忆增强智能体
@@ -236,10 +237,21 @@ async def test_langmem_integration():
             create_manage_memory_tool,
             create_search_memory_tool
         )
+        from langchain_openai import ChatOpenAI
+        from config.settings import get_settings
         print("✅ LangMem模块导入成功")
         
+        # 创建语言模型实例
+        settings = get_settings()
+        llm = ChatOpenAI(
+            model="qwen-turbo",
+            temperature=0.7,
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+        
         # 测试创建记忆管理器
-        langmem_manager = create_memory_manager()
+        langmem_manager = create_memory_manager(llm)
         print("✅ LangMem记忆管理器创建成功")
         
         # 测试创建记忆工具

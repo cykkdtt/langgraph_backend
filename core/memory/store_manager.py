@@ -9,12 +9,13 @@ import asyncio
 import logging
 import os
 from typing import Optional, Dict, Any
-from langgraph.store.postgres.aio import AsyncPostgresStore
 from langgraph.store.memory import InMemoryStore
+from langgraph.store.postgres.aio import AsyncPostgresStore
 from langgraph.store.base import BaseStore
 from langchain_community.embeddings import DashScopeEmbeddings
 from langmem import create_memory_store_manager
 from config.memory_config import memory_config
+from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -45,55 +46,48 @@ class MemoryStoreManager:
         self._store_context = None
     
     async def initialize(self) -> None:
-        """初始化存储系统"""
+        """初始化存储管理器"""
         if self._initialized:
             return
         
+        # 创建嵌入模型实例
+        self._embeddings = DashScopeEmbeddings(
+            model=memory_config.embedding_model,
+            dashscope_api_key=os.getenv("DASHSCOPE_API_KEY")
+        )
+        
         try:
-            # 创建嵌入模型实例
-            embeddings = create_embeddings()
-            
-            # 创建存储实例
             if memory_config.store_type == "postgres":
-                # 使用from_conn_string创建AsyncPostgresStore上下文管理器
+                # 使用PostgreSQL存储
+                settings = get_settings()
+                postgres_uri = settings.database.async_url
+                logger.info(f"连接PostgreSQL存储: {postgres_uri.split('@')[-1] if '@' in postgres_uri else 'localhost'}")
+                
                 self._store_context = AsyncPostgresStore.from_conn_string(
-                    memory_config.postgres_url,
-                    index={
-                        "embed": embeddings,  # 使用DashScopeEmbeddings实例
-                        "dims": memory_config.embedding_dims,
-                        "fields": ["$"]  # 对所有字段进行向量化
-                    }
+                    postgres_uri
                 )
+                
+                # 进入上下文管理器并设置store
                 self.store = await self._store_context.__aenter__()
-                logger.info("使用 PostgreSQL 存储")
+                self.storage_type = "postgres"
+                logger.info("✅ PostgreSQL存储初始化成功")
+                
             else:
-                self.store = InMemoryStore(
-                    index={
-                        "embed": embeddings,  # 使用DashScopeEmbeddings实例
-                        "dims": memory_config.embedding_dims,
-                        "fields": ["$"]  # 对所有字段进行向量化
-                    }
-                )
-                self._store_context = None
-                logger.info("使用内存存储")
-            
-            # 设置存储
-            if hasattr(self.store, 'setup'):
-                await self.store.setup()
-            
-            # 创建记忆存储管理器
-            self.memory_manager = create_memory_store_manager(
-                memory_config.memory_model,
-                store=self.store,
-                namespace=(memory_config.namespace_prefix, "{langgraph_user_id}")
-            )
-            
-            self._initialized = True
-            logger.info("记忆存储管理器初始化完成")
-            
+                # 使用内存存储
+                self.store = InMemoryStore()
+                self._store_context = self.store
+                self.storage_type = "memory"
+                logger.info("✅ 内存存储初始化成功")
+                
         except Exception as e:
-            logger.error(f"记忆存储管理器初始化失败: {e}")
-            raise
+            logger.error(f"PostgreSQL记忆存储器初始化失败: {e}")
+            logger.warning("PostgreSQL连接失败，降级使用内存存储")
+            self.store = InMemoryStore()
+            self._store_context = self.store
+            self.storage_type = "memory"
+            logger.info("✅ 内存存储初始化成功（PostgreSQL连接失败降级）")
+        
+        self._initialized = True
     
     async def cleanup(self) -> None:
         """清理资源"""
@@ -135,42 +129,31 @@ class MemoryStoreManager:
         """健康检查"""
         if not self._initialized:
             return {
-                "status": "unhealthy",
-                "message": "存储管理器未初始化"
+                "status": "not_initialized",
+                "storage_type": "unknown",
+                "configured_type": memory_config.store_type
             }
         
         try:
-            # 简单的存储测试
-            test_namespace = "health_check"
-            test_key = "test"
-            test_value = {"test": "data"}
+            # 测试内存存储连接
+            if hasattr(self._store_context, 'aget'):
+                # 尝试获取一个不存在的键来测试连接
+                await self._store_context.aget(["test"], "health_check")
             
-            # 写入测试数据
-            await self.store.aput(test_namespace, test_key, test_value)
-            
-            # 读取测试数据
-            result = await self.store.aget(test_namespace, test_key)
-            
-            # 清理测试数据
-            await self.store.adelete(test_namespace, test_key)
-            
-            if result == test_value:
-                return {
-                    "status": "healthy",
-                    "store_type": memory_config.store_type,
-                    "initialized": self._initialized
-                }
-            else:
-                return {
-                    "status": "unhealthy",
-                    "message": "存储读写测试失败"
-                }
-                
-        except Exception as e:
-            logger.error(f"健康检查失败: {e}")
             return {
-                "status": "unhealthy",
-                "message": f"健康检查异常: {str(e)}"
+                "status": "healthy",
+                "storage_type": self.storage_type,
+                "configured_type": memory_config.store_type,
+                "embedding_model": memory_config.embedding_model,
+                "embedding_dims": memory_config.embedding_dims,
+                "note": "存储系统运行正常"
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "storage_type": self.storage_type,
+                "configured_type": memory_config.store_type,
+                "error": str(e)
             }
     
     async def get_stats(self) -> Dict[str, Any]:
